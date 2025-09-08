@@ -1,0 +1,31 @@
+name: CSX - Record & Transcribe
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Recording length (minutes)"
+        required: true
+        default: "30"
+        type: string
+      model:
+        description: "Whisper model"
+        required: true
+        default: "small"
+        type: string
+  # CSX at 11:30 AM ET on Sept 11, 2025 = 15:30 UTC
+  schedule:
+    - cron: "30 15 11 9 *"
+
+jobs:
+  call:
+    uses: ./.github/workflows/record_transcribe_reusable.yml
+    with:
+      url: "https://event.webcasts.com/starthere.jsp?ei=1732241&tp_key=831628feae&tp_special=8"
+      minutes: ${{ inputs.minutes }}
+      model:   ${{ inputs.model }}
+    secrets:
+      FIRST:   ${{ secrets.CSX_FIRST }}
+      LAST:    ${{ secrets.CSX_LAST }}
+      COMPANY: ${{ secrets.CSX_COMPANY }}
+      EMAIL:   ${{ secrets.CSX_EMAIL }}
