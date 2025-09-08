@@ -1,0 +1,158 @@
+name: Reusable - Record & Transcribe HLS (no repo .py)
+
+on:
+  workflow_call:
+    inputs:
+      url:
+        required: true
+        type: string
+      minutes:
+        required: false
+        type: string
+        default: "30"
+      model:
+        required: false
+        type: string
+        default: "small"
+    secrets:
+      FIRST:
+        required: true
+      LAST:
+        required: true
+      COMPANY:
+        required: true
+      EMAIL:
+        required: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tools (Playwright, ffmpeg, Streamlink, Whisper)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq streamlink
+          python -m pip install --upgrade pip
+          python -m pip install playwright openai-whisper
+          python -m playwright install --with-deps chromium
+
+      # Inline Playwright helper (created at runtime; not committed to repo)
+      - name: Create inline Playwright capture helper
+        run: |
+          cat > /tmp/hls_capture_inline.py <<'PY'
+          import os, json, asyncio, re
+          from urllib.parse import urlparse
+          from playwright.async_api import async_playwright
+          URL=os.environ["EVENT_URL"]; FIRST=os.environ["FIRST"]; LAST=os.environ["LAST"]; COMPANY=os.environ["COMPANY"]; EMAIL=os.environ["EMAIL"]
+          LABELS={"First Name":FIRST,"Last Name":LAST,"Company":COMPANY,"Email":EMAIL}
+          M3U8_RE=re.compile(r"\.m3u8(\?.*)?$", re.IGNORECASE)
+          async def main():
+              async with async_playwright() as p:
+                  b=await p.chromium.launch(headless=True); c=await b.new_context(); pg=await c.new_page()
+                  found={"url":None,"headers":{}}
+                  async def on_resp(r):
+                      try:
+                          u=r.url
+                          if M3U8_RE.search(u) and not found["url"]:
+                              found["url"]=u
+                              found["headers"]["Referer"]=pg.url
+                              pr=urlparse(pg.url); found["headers"]["Origin"]=f"{pr.scheme}://{pr.netloc}"
+                      except: pass
+                  pg.on("response", on_resp)
+                  await pg.goto(URL, wait_until="domcontentloaded")
+                  for lab,val in LABELS.items():
+                      try: await pg.get_by_label(lab, exact=True).fill(val)
+                      except: pass
+                  async def tf(sel,val):
+                      try: await pg.fill(sel,val); return True
+                      except: return False
+                  await tf("input[name='firstName']",FIRST); await tf("input[name='firstname']",FIRST); await tf("input[placeholder='First Name']",FIRST)
+                  await tf("input[name='lastName']",LAST);  await tf("input[name='lastname']",LAST);  await tf("input[placeholder='Last Name']",LAST)
+                  await tf("input[name='company']",COMPANY); await tf("input[placeholder='Company']",COMPANY)
+                  await tf("input[name='email']",EMAIL);   await tf("input[type='email']",EMAIL)
+                  for sel in ["button[type='submit']","input[type='submit']","button:has-text('Enter')","button:has-text('Register')","button:has-text('Log In')","button:has-text('Watch')"]:
+                      try: await pg.click(sel); break
+                      except: pass
+                  await pg.wait_for_load_state("networkidle", timeout=60000)
+                  for _ in range(60):
+                      if found["url"]: break
+                      await asyncio.sleep(1)
+                  ck=await c.cookies()
+                  cookie="; ".join(f"{x['name']}={x['value']}" for x in ck) if ck else ""
+                  json.dump({"m3u8_url":found["url"],"headers":found["headers"],"cookies":cookie}, open("session_info.json","w"))
+                  print("Captured:", json.dumps({"has_m3u8": bool(found["url"])}))
+                  await b.close()
+          if __name__=="__main__": asyncio.run(main())
+          PY
+
+      - name: Login & capture HLS info
+        env:
+          EVENT_URL: ${{ inputs.url }}
+          FIRST:     ${{ secrets.FIRST }}
+          LAST:      ${{ secrets.LAST }}
+          COMPANY:   ${{ secrets.COMPANY }}
+          EMAIL:     ${{ secrets.EMAIL }}
+        run: |
+          python /tmp/hls_capture_inline.py
+          echo "== session_info.json (sanitized) =="
+          cat session_info.json | jq '{m3u8_url, headers: (.headers|keys), has_cookies: (.cookies|length>0)}'
+
+      - name: Record audio (ffmpeg with reconnect; Streamlink fallback)
+        id: rec
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          mkdir -p recordings
+          URL=$(jq -r '.m3u8_url' session_info.json)
+          REF=$(jq -r '.headers.Referer // empty' session_info.json)
+          ORG=$(jq -r '.headers.Origin // empty' session_info.json)
+          CK=$(jq -r '.cookies // empty' session_info.json)
+          TS=$(date -u +"%Y%m%d-%H%M%S"); OUT="recordings/event-${TS}.m4a"
+          HDRS=""
+          [ -n "$CK" ]  && HDRS="${HDRS}Cookie: ${CK}\r\n"
+          [ -n "$REF" ] && HDRS="${HDRS}Referer: ${REF}\r\n"
+          [ -n "$ORG" ] && HDRS="${HDRS}Origin: ${ORG}\r\n"
+          RECORD_CMD='ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -headers "$HDRS" -i "$URL" -t $((MINUTES*60)) -vn -c:a aac -b:a 128k "$OUT"'
+          if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+            echo "Trying ffmpeg directly on captured m3u8..."
+            if eval $RECORD_CMD; then
+              echo "OK via ffmpeg"
+            else
+              echo "ffmpeg failed; trying Streamlink pipeline..."
+              if streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$URL" best -O | \
+                 ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -i - -t $((MINUTES*60)) -vn -c:a aac -b:a 128k "$OUT"; then
+                echo "OK via Streamlink"
+              else
+                echo "Both ffmpeg and Streamlink attempts failed."; exit 1
+              fi
+            fi
+          else
+            echo "No m3u8 captured; attempting Streamlink on the page URL (may fail)..."
+            PAGE_URL="${{ inputs.url }}"
+            if streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$PAGE_URL" best -O | \
+               ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -i - -t $((MINUTES*60)) -vn -c:a aac -b:a 128k "$OUT"; then
+              echo "OK via Streamlink (page URL)"
+            else
+              echo "Fallback also failed."; exit 1
+            fi
+          fi
+          echo "out_file=$OUT" >> $GITHUB_OUTPUT
+
+      - name: Transcribe with Whisper (CLI)
+        run: |
+          FILE=$(ls -1 recordings/event-*.m4a | tail -n 1)
+          whisper "$FILE" --model "${{ inputs.model }}" --task transcribe --output_format txt,vtt --verbose False
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-and-transcripts
+          path: recordings/*
+          retention-days: 14
