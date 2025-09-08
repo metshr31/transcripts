@@ -14,6 +14,10 @@ on:
         required: false
         type: string
         default: "small"
+      probe_seconds:           # NEW
+        required: false
+        type: string
+        default: "0"
     secrets:
       FIRST:
         required: true
@@ -43,7 +47,6 @@ jobs:
           python -m pip install playwright openai-whisper
           python -m playwright install --with-deps chromium
 
-      # Inline Playwright helper (created at runtime; not committed to repo)
       - name: Create inline Playwright capture helper
         run: |
           cat > /tmp/hls_capture_inline.py <<'PY'
@@ -108,18 +111,28 @@ jobs:
         id: rec
         env:
           MINUTES: ${{ inputs.minutes }}
+          PROBE:   ${{ inputs.probe_seconds }}   # NEW
         run: |
           mkdir -p recordings
           URL=$(jq -r '.m3u8_url' session_info.json)
           REF=$(jq -r '.headers.Referer // empty' session_info.json)
           ORG=$(jq -r '.headers.Origin // empty' session_info.json)
           CK=$(jq -r '.cookies // empty' session_info.json)
+
+          # Use probe seconds if > 0, else full minutes
+          if [ -n "$PROBE" ] && [ "$PROBE" != "0" ]; then
+            DURATION=$PROBE
+          else
+            DURATION=$((MINUTES*60))
+          fi
+
           TS=$(date -u +"%Y%m%d-%H%M%S"); OUT="recordings/event-${TS}.m4a"
           HDRS=""
           [ -n "$CK" ]  && HDRS="${HDRS}Cookie: ${CK}\r\n"
           [ -n "$REF" ] && HDRS="${HDRS}Referer: ${REF}\r\n"
           [ -n "$ORG" ] && HDRS="${HDRS}Origin: ${ORG}\r\n"
-          RECORD_CMD='ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -headers "$HDRS" -i "$URL" -t $((MINUTES*60)) -vn -c:a aac -b:a 128k "$OUT"'
+
+          RECORD_CMD='ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -headers "$HDRS" -i "$URL" -t $DURATION -vn -c:a aac -b:a 128k "$OUT"'
           if [ -n "$URL" ] && [ "$URL" != "null" ]; then
             echo "Trying ffmpeg directly on captured m3u8..."
             if eval $RECORD_CMD; then
@@ -127,7 +140,7 @@ jobs:
             else
               echo "ffmpeg failed; trying Streamlink pipeline..."
               if streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$URL" best -O | \
-                 ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -i - -t $((MINUTES*60)) -vn -c:a aac -b:a 128k "$OUT"; then
+                 ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT"; then
                 echo "OK via Streamlink"
               else
                 echo "Both ffmpeg and Streamlink attempts failed."; exit 1
@@ -137,12 +150,13 @@ jobs:
             echo "No m3u8 captured; attempting Streamlink on the page URL (may fail)..."
             PAGE_URL="${{ inputs.url }}"
             if streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$PAGE_URL" best -O | \
-               ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -i - -t $((MINUTES*60)) -vn -c:a aac -b:a 128k "$OUT"; then
+               ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT"; then
               echo "OK via Streamlink (page URL)"
             else
               echo "Fallback also failed."; exit 1
             fi
           fi
+
           echo "out_file=$OUT" >> $GITHUB_OUTPUT
 
       - name: Transcribe with Whisper (CLI)
