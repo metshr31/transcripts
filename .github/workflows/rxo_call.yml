@@ -1,0 +1,31 @@
+name: RXO - Record & Transcribe
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Recording length (minutes)"
+        required: true
+        default: "30"
+        type: string
+      model:
+        description: "Whisper model"
+        required: true
+        default: "small"
+        type: string
+  # RXO at 1:45 PM ET on Sept 10, 2025 = 17:45 UTC
+  schedule:
+    - cron: "45 17 10 9 *"
+
+jobs:
+  call:
+    uses: ./.github/workflows/record_transcribe_reusable.yml
+    with:
+      url: "https://event.webcasts.com/starthere.jsp?ei=1732213&tp_key=e4310c0126&tp_special=8"
+      minutes: ${{ inputs.minutes }}
+      model:   ${{ inputs.model }}
+    secrets:
+      FIRST:   ${{ secrets.RXO_FIRST }}
+      LAST:    ${{ secrets.RXO_LAST }}
+      COMPANY: ${{ secrets.RXO_COMPANY }}
+      EMAIL:   ${{ secrets.RXO_EMAIL }}
