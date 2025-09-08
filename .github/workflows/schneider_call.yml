@@ -1,0 +1,31 @@
+name: Schneider National - Record & Transcribe
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Recording length (minutes)"
+        required: true
+        default: "30"
+        type: string
+      model:
+        description: "Whisper model"
+        required: true
+        default: "small"
+        type: string
+  # One-time schedule: 11:45 AM ET = 15:45 UTC on Sept 11, 2025
+  schedule:
+    - cron: "45 15 11 9 *"
+
+jobs:
+  call:
+    uses: ./.github/workflows/record_transcribe_reusable.yml
+    with:
+      url: "https://event.webcasts.com/starthere.jsp?ei=1686422&tp_key=196fd37198&tp_special=8"
+      minutes: ${{ inputs.minutes }}
+      model:   ${{ inputs.model }}
+    secrets:
+      FIRST:   ${{ secrets.SCHNEIDER_FIRST }}
+      LAST:    ${{ secrets.SCHNEIDER_LAST }}
+      COMPANY: ${{ secrets.SCHNEIDER_COMPANY }}
+      EMAIL:   ${{ secrets.SCHNEIDER_EMAIL }}
