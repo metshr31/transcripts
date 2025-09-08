@@ -15,7 +15,7 @@ on:
         type: string
   # Optional: one-time schedule (10:00 ET = 14:00 UTC on Sept 10, 2025)
   schedule:
-    - cron: "0 14 10 9 *"
+    - cron: "55 13 10 9 *"
 
 jobs:
   call:
