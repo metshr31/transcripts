@@ -47,7 +47,7 @@ jobs:
           python -m pip install playwright openai-whisper
           python -m playwright install --with-deps chromium
 
-      # Inline Playwright helper (created at runtime; not committed to repo)
+      # Inline Playwright helper
       - name: Create inline Playwright capture helper
         run: |
           cat > /tmp/hls_capture_inline.py <<'PY'
@@ -104,7 +104,6 @@ jobs:
           COMPANY:   ${{ secrets.COMPANY }}
           EMAIL:     ${{ secrets.EMAIL }}
         run: |
-          # If it's already an HLS manifest, skip Playwright and write session_info.json directly
           if echo "$EVENT_URL" | grep -Eiq '\.m3u8(\?.*)?$'; then
             echo "Direct .m3u8 detected; skipping Playwright."
             printf '%s\n' \
@@ -132,7 +131,6 @@ jobs:
           ORG=$(jq -r '.headers.Origin // empty' session_info.json)
           CK=$(jq -r '.cookies // empty' session_info.json)
 
-          # Use probe seconds if provided (>0), else full minutes
           if [ -n "$PROBE" ] && [ "$PROBE" != "0" ]; then
             DURATION=$PROBE
           else
@@ -183,8 +181,18 @@ jobs:
 
       - name: Transcribe with Whisper (CLI)
         run: |
-          FILE=$(ls -1 recordings/event-*.m4a | tail -n 1)
-          whisper "$FILE" --model "${{ inputs.model }}" --task transcribe --output_format txt,vtt --verbose False
+          set -e
+          FILE=$(ls -1 recordings/event-*.m4a | tail -n 1 || true)
+          if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+            echo "No recording found in ./recordings"
+            ls -l recordings || true
+            exit 1
+          fi
+          whisper "$FILE" --model "${{ inputs.model }}" \
+            --task transcribe \
+            --output_format all \
+            --output_dir recordings \
+            --verbose False
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
