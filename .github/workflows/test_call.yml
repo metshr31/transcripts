@@ -1,0 +1,29 @@
+name: TEST - Record & Transcribe (public HLS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe_seconds:
+        description: "Test duration (seconds)"
+        required: true
+        default: "15"
+        type: string
+      model:
+        description: "Whisper model"
+        required: true
+        default: "small"
+        type: string
+
+jobs:
+  call:
+    uses: ./.github/workflows/record_transcribe_reusable.yml
+    with:
+      url: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"   # public demo
+      minutes: "1"                       # ignored if probe_seconds > 0
+      model:   ${{ inputs.model }}
+      probe_seconds: ${{ inputs.probe_seconds }}
+    secrets:
+      FIRST:   ${{ secrets.NS_FIRST }}
+      LAST:    ${{ secrets.NS_LAST }}
+      COMPANY: ${{ secrets.NS_COMPANY }}
+      EMAIL:   ${{ secrets.NS_EMAIL }}
