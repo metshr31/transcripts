@@ -14,7 +14,7 @@ on:
         required: false
         type: string
         default: "small"
-      probe_seconds:           # NEW
+      probe_seconds:           # optional: quick test duration
         required: false
         type: string
         default: "0"
@@ -47,6 +47,7 @@ jobs:
           python -m pip install playwright openai-whisper
           python -m playwright install --with-deps chromium
 
+      # Inline Playwright helper (created at runtime; not committed to repo)
       - name: Create inline Playwright capture helper
         run: |
           cat > /tmp/hls_capture_inline.py <<'PY'
@@ -95,7 +96,7 @@ jobs:
           if __name__=="__main__": asyncio.run(main())
           PY
 
-      - name: Login & capture HLS info
+      - name: Login & capture HLS info (auto-skip for .m3u8)
         env:
           EVENT_URL: ${{ inputs.url }}
           FIRST:     ${{ secrets.FIRST }}
@@ -103,7 +104,19 @@ jobs:
           COMPANY:   ${{ secrets.COMPANY }}
           EMAIL:     ${{ secrets.EMAIL }}
         run: |
-          python /tmp/hls_capture_inline.py
+          # If it's already an HLS manifest, skip Playwright and write session_info.json directly
+          if echo "$EVENT_URL" | grep -Eiq '\.m3u8(\?.*)?$'; then
+            echo "Direct .m3u8 detected; skipping Playwright."
+            printf '%s\n' \
+              '{' \
+              "  \"m3u8_url\": \"${EVENT_URL}\"," \
+              '  "headers": {},' \
+              '  "cookies": ""' \
+              '}' > session_info.json
+          else
+            echo "Not a direct .m3u8; using Playwright to pass the gate and capture."
+            python /tmp/hls_capture_inline.py
+          fi
           echo "== session_info.json (sanitized) =="
           cat session_info.json | jq '{m3u8_url, headers: (.headers|keys), has_cookies: (.cookies|length>0)}'
 
@@ -111,7 +124,7 @@ jobs:
         id: rec
         env:
           MINUTES: ${{ inputs.minutes }}
-          PROBE:   ${{ inputs.probe_seconds }}   # NEW
+          PROBE:   ${{ inputs.probe_seconds }}
         run: |
           mkdir -p recordings
           URL=$(jq -r '.m3u8_url' session_info.json)
@@ -119,7 +132,7 @@ jobs:
           ORG=$(jq -r '.headers.Origin // empty' session_info.json)
           CK=$(jq -r '.cookies // empty' session_info.json)
 
-          # Use probe seconds if > 0, else full minutes
+          # Use probe seconds if provided (>0), else full minutes
           if [ -n "$PROBE" ] && [ "$PROBE" != "0" ]; then
             DURATION=$PROBE
           else
@@ -133,6 +146,7 @@ jobs:
           [ -n "$ORG" ] && HDRS="${HDRS}Origin: ${ORG}\r\n"
 
           RECORD_CMD='ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -headers "$HDRS" -i "$URL" -t $DURATION -vn -c:a aac -b:a 128k "$OUT"'
+
           if [ -n "$URL" ] && [ "$URL" != "null" ]; then
             echo "Trying ffmpeg directly on captured m3u8..."
             if eval $RECORD_CMD; then
@@ -140,7 +154,11 @@ jobs:
             else
               echo "ffmpeg failed; trying Streamlink pipeline..."
               if streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$URL" best -O | \
-                 ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT"; then
+                 ffmpeg -hide_banner -loglevel error \
+                        -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 \
+                        -rw_timeout 15000000 \
+                        -user_agent "Mozilla/5.0" \
+                        -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT"; then
                 echo "OK via Streamlink"
               else
                 echo "Both ffmpeg and Streamlink attempts failed."; exit 1
@@ -150,7 +168,11 @@ jobs:
             echo "No m3u8 captured; attempting Streamlink on the page URL (may fail)..."
             PAGE_URL="${{ inputs.url }}"
             if streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$PAGE_URL" best -O | \
-               ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT"; then
+               ffmpeg -hide_banner -loglevel error \
+                      -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 \
+                      -rw_timeout 15000000 \
+                      -user_agent "Mozilla/5.0" \
+                      -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT"; then
               echo "OK via Streamlink (page URL)"
             else
               echo "Fallback also failed."; exit 1
