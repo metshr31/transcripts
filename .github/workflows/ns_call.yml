@@ -1,0 +1,31 @@
+name: Norfolk Southern - Record & Transcribe
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Recording length (minutes)"
+        required: true
+        default: "30"
+        type: string
+      model:
+        description: "Whisper model"
+        required: true
+        default: "small"
+        type: string
+  # Optional: one-time schedule (10:00 ET = 14:00 UTC on Sept 10, 2025)
+  schedule:
+    - cron: "0 14 10 9 *"
+
+jobs:
+  call:
+    uses: ./.github/workflows/record_transcribe_reusable.yml
+    with:
+      url: "https://event.webcasts.com/viewer/event.jsp?ei=1734306&tp_key=290441ade4"
+      minutes: ${{ inputs.minutes }}
+      model:   ${{ inputs.model }}
+    secrets:
+      FIRST:   ${{ secrets.NS_FIRST }}
+      LAST:    ${{ secrets.NS_LAST }}
+      COMPANY: ${{ secrets.NS_COMPANY }}
+      EMAIL:   ${{ secrets.NS_EMAIL }}
