@@ -6,7 +6,7 @@ on:
       minutes:
         description: "Recording length (minutes)"
         required: true
-        default: "30"
+        default: "35"
         type: string
       model:
         description: "Whisper model"
