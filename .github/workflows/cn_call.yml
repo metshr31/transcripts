@@ -6,7 +6,7 @@ on:
       minutes:
         description: "Recording length (minutes)"
         required: true
-        default: "30"
+        default: "35"
         type: string
       model:
         description: "Whisper model"
@@ -15,7 +15,7 @@ on:
         type: string
   # CN at 10:00 AM ET on Sept 11, 2025 = 14:00 UTC
   schedule:
-    - cron: "0 14 11 9 *"
+  - cron: "55 13 11 9 *"  # 13:55 UTC = 9:55 ET
 
 jobs:
   call:
