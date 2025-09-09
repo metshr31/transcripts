@@ -6,16 +6,21 @@ on:
       minutes:
         description: "Recording length (minutes)"
         required: true
-        default: "30"
+        default: "35"
         type: string
       model:
         description: "Whisper model"
         required: true
         default: "small"
         type: string
-  # RXO at 1:45 PM ET on Sept 10, 2025 = 17:45 UTC
+      probe_seconds:
+        description: "Short test duration (seconds). 0 = full run"
+        required: true
+        default: "0"
+        type: string
+  # RXO scheduled 5 minutes early: 1:40 PM ET on Sept 10, 2025 = 17:40 UTC
   schedule:
-    - cron: "45 17 10 9 *"
+    - cron: "40 17 10 9 *"
 
 jobs:
   call:
@@ -24,8 +29,12 @@ jobs:
       url: "https://event.webcasts.com/starthere.jsp?ei=1732213&tp_key=e4310c0126&tp_special=8"
       minutes: ${{ inputs.minutes }}
       model:   ${{ inputs.model }}
+      probe_seconds: ${{ inputs.probe_seconds }}
+      diarize: true
+      max_speakers: "0"
     secrets:
-      FIRST:   ${{ secrets.RXO_FIRST }}
-      LAST:    ${{ secrets.RXO_LAST }}
-      COMPANY: ${{ secrets.RXO_COMPANY }}
-      EMAIL:   ${{ secrets.RXO_EMAIL }}
+      FIRST:     ${{ secrets.RXO_FIRST }}
+      LAST:      ${{ secrets.RXO_LAST }}
+      COMPANY:   ${{ secrets.RXO_COMPANY }}
+      EMAIL:     ${{ secrets.RXO_EMAIL }}
+      HF_TOKEN:  ${{ secrets.HF_TOKEN }}
