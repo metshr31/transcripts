@@ -13,7 +13,12 @@ on:
         required: true
         default: "small"
         type: string
-  # CSX at 11:30 AM ET on Sept 11, 2025 = 15:30 UTC
+      probe_seconds:
+        description: "Short test duration (seconds). 0 = full run"
+        required: true
+        default: "0"
+        type: string
+  # CSX scheduled 5 minutes early: 11:25 AM ET on Sept 11, 2025 = 15:25 UTC
   schedule:
     - cron: "25 15 11 9 *"
 
@@ -24,8 +29,12 @@ jobs:
       url: "https://event.webcasts.com/starthere.jsp?ei=1732241&tp_key=831628feae&tp_special=8"
       minutes: ${{ inputs.minutes }}
       model:   ${{ inputs.model }}
+      probe_seconds: ${{ inputs.probe_seconds }}
+      diarize: true
+      max_speakers: "0"
     secrets:
-      FIRST:   ${{ secrets.CSX_FIRST }}
-      LAST:    ${{ secrets.CSX_LAST }}
-      COMPANY: ${{ secrets.CSX_COMPANY }}
-      EMAIL:   ${{ secrets.CSX_EMAIL }}
+      FIRST:     ${{ secrets.CSX_FIRST }}
+      LAST:      ${{ secrets.CSX_LAST }}
+      COMPANY:   ${{ secrets.CSX_COMPANY }}
+      EMAIL:     ${{ secrets.CSX_EMAIL }}
+      HF_TOKEN:  ${{ secrets.HF_TOKEN }}
