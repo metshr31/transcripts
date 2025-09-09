@@ -6,7 +6,7 @@ on:
       minutes:
         description: "Recording length (minutes)"
         required: true
-        default: "35"    # bumped default
+        default: "35"
         type: string
       model:
         description: "Whisper model"
@@ -18,8 +18,7 @@ on:
         required: true
         default: "0"
         type: string
-  # UP at 11:30 AM ET on Sept 10, 2025 = 15:30 UTC
-  # Start 5 min early = 15:25 UTC
+  # UP scheduled 5 minutes early: 11:25 AM ET on Sept 10, 2025 = 15:25 UTC
   schedule:
     - cron: "25 15 10 9 *"
 
@@ -31,8 +30,11 @@ jobs:
       minutes: ${{ inputs.minutes }}
       model:   ${{ inputs.model }}
       probe_seconds: ${{ inputs.probe_seconds }}
+      diarize: true
+      max_speakers: "0"
     secrets:
-      FIRST:   ${{ secrets.UP_FIRST }}
-      LAST:    ${{ secrets.UP_LAST }}
-      COMPANY: ${{ secrets.UP_COMPANY }}
-      EMAIL:   ${{ secrets.UP_EMAIL }}
+      FIRST:     ${{ secrets.UP_FIRST }}
+      LAST:      ${{ secrets.UP_LAST }}
+      COMPANY:   ${{ secrets.UP_COMPANY }}
+      EMAIL:     ${{ secrets.UP_EMAIL }}
+      HF_TOKEN:  ${{ secrets.HF_TOKEN }}
