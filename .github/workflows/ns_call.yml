@@ -6,14 +6,19 @@ on:
       minutes:
         description: "Recording length (minutes)"
         required: true
-        default: "30"
+        default: "35"
         type: string
       model:
         description: "Whisper model"
         required: true
         default: "small"
         type: string
-  # Optional: one-time schedule (10:00 ET = 14:00 UTC on Sept 10, 2025)
+      probe_seconds:
+        description: "Short test duration (seconds). 0 = full run"
+        required: true
+        default: "0"
+        type: string
+  # NS scheduled 5 minutes early: 9:55 AM ET on Sept 10, 2025 = 13:55 UTC
   schedule:
     - cron: "55 13 10 9 *"
 
@@ -24,8 +29,12 @@ jobs:
       url: "https://event.webcasts.com/viewer/event.jsp?ei=1734306&tp_key=290441ade4"
       minutes: ${{ inputs.minutes }}
       model:   ${{ inputs.model }}
+      probe_seconds: ${{ inputs.probe_seconds }}
+      diarize: true
+      max_speakers: "0"
     secrets:
-      FIRST:   ${{ secrets.NS_FIRST }}
-      LAST:    ${{ secrets.NS_LAST }}
-      COMPANY: ${{ secrets.NS_COMPANY }}
-      EMAIL:   ${{ secrets.NS_EMAIL }}
+      FIRST:     ${{ secrets.NS_FIRST }}
+      LAST:      ${{ secrets.NS_LAST }}
+      COMPANY:   ${{ secrets.NS_COMPANY }}
+      EMAIL:     ${{ secrets.NS_EMAIL }}
+      HF_TOKEN:  ${{ secrets.HF_TOKEN }}
