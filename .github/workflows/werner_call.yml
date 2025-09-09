@@ -6,16 +6,21 @@ on:
       minutes:
         description: "Recording length (minutes)"
         required: true
-        default: "30"
+        default: "35"
         type: string
       model:
         description: "Whisper model"
         required: true
         default: "small"
         type: string
-  # 7:50 PM ET on Sept 10, 2025 = 23:50 UTC
+      probe_seconds:
+        description: "Short test duration (seconds). 0 = full run"
+        required: true
+        default: "0"
+        type: string
+  # Werner scheduled 5 minutes early: 7:45 PM ET on Sept 10, 2025 = 23:45 UTC
   schedule:
-    - cron: "50 23 10 9 *"
+    - cron: "45 23 10 9 *"
 
 jobs:
   call:
@@ -24,8 +29,12 @@ jobs:
       url: "https://event.webcasts.com/starthere.jsp?ei=1732689&tp_key=88708506b9&tp_special=8"
       minutes: ${{ inputs.minutes }}
       model:   ${{ inputs.model }}
+      probe_seconds: ${{ inputs.probe_seconds }}
+      diarize: true
+      max_speakers: "0"
     secrets:
-      FIRST:   ${{ secrets.WERNER_FIRST }}
-      LAST:    ${{ secrets.WERNER_LAST }}
-      COMPANY: ${{ secrets.WERNER_COMPANY }}
-      EMAIL:   ${{ secrets.WERNER_EMAIL }}
+      FIRST:     ${{ secrets.WERNER_FIRST }}
+      LAST:      ${{ secrets.WERNER_LAST }}
+      COMPANY:   ${{ secrets.WERNER_COMPANY }}
+      EMAIL:     ${{ secrets.WERNER_EMAIL }}
+      HF_TOKEN:  ${{ secrets.HF_TOKEN }}
