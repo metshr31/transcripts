@@ -13,9 +13,14 @@ on:
         required: true
         default: "small"
         type: string
-  # CN at 10:00 AM ET on Sept 11, 2025 = 14:00 UTC
+      probe_seconds:
+        description: "Short test duration (seconds). 0 = full run"
+        required: true
+        default: "0"
+        type: string
+  # CN scheduled 5 minutes early: 9:55 AM ET on Sept 11, 2025 = 13:55 UTC
   schedule:
-  - cron: "55 13 11 9 *"  # 13:55 UTC = 9:55 ET
+    - cron: "55 13 11 9 *"
 
 jobs:
   call:
@@ -24,8 +29,12 @@ jobs:
       url: "https://event.webcasts.com/starthere.jsp?ei=1732242&tp_key=6ee27846a6&tp_special=8"
       minutes: ${{ inputs.minutes }}
       model:   ${{ inputs.model }}
+      probe_seconds: ${{ inputs.probe_seconds }}
+      diarize: true
+      max_speakers: "0"
     secrets:
-      FIRST:   ${{ secrets.CN_FIRST }}
-      LAST:    ${{ secrets.CN_LAST }}
-      COMPANY: ${{ secrets.CN_COMPANY }}
-      EMAIL:   ${{ secrets.CN_EMAIL }}
+      FIRST:     ${{ secrets.CN_FIRST }}
+      LAST:      ${{ secrets.CN_LAST }}
+      COMPANY:   ${{ secrets.CN_COMPANY }}
+      EMAIL:     ${{ secrets.CN_EMAIL }}
+      HF_TOKEN:  ${{ secrets.HF_TOKEN }}
