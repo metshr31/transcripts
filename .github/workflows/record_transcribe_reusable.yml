@@ -1,4 +1,4 @@
-name: Reusable - Record & Transcribe HLS (no repo .py)
+name: Reusable - Record & Transcribe HLS (with diarization)
 
 on:
   workflow_call:
@@ -9,12 +9,20 @@ on:
       minutes:
         required: false
         type: string
-        default: "30"
+        default: "35"            # default bumped to 35
       model:
         required: false
         type: string
         default: "small"
-      probe_seconds:           # optional: quick test duration
+      probe_seconds:
+        required: false
+        type: string
+        default: "0"
+      diarize:                   # NEW: turn speaker diarization on/off
+        required: false
+        type: boolean
+        default: false
+      max_speakers:              # NEW: 0 = auto, >0 = force that many
         required: false
         type: string
         default: "0"
@@ -27,6 +35,8 @@ on:
         required: true
       EMAIL:
         required: true
+      HF_TOKEN:                  # NEW: Hugging Face token for diarization
+        required: false
 
 jobs:
   run:
@@ -47,7 +57,7 @@ jobs:
           python -m pip install playwright openai-whisper
           python -m playwright install --with-deps chromium
 
-      # Inline Playwright helper
+      # Inline Playwright helper for gated streams
       - name: Create inline Playwright capture helper
         run: |
           cat > /tmp/hls_capture_inline.py <<'PY'
@@ -113,7 +123,7 @@ jobs:
               '  "cookies": ""' \
               '}' > session_info.json
           else
-            echo "Not a direct .m3u8; using Playwright to pass the gate and capture."
+            echo "Not a direct .m3u8; using Playwright to capture."
             python /tmp/hls_capture_inline.py
           fi
           echo "== session_info.json (sanitized) =="
@@ -146,34 +156,26 @@ jobs:
           RECORD_CMD='ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -headers "$HDRS" -i "$URL" -t $DURATION -vn -c:a aac -b:a 128k "$OUT"'
 
           if [ -n "$URL" ] && [ "$URL" != "null" ]; then
-            echo "Trying ffmpeg directly on captured m3u8..."
+            echo "Trying ffmpeg directly..."
             if eval $RECORD_CMD; then
               echo "OK via ffmpeg"
             else
-              echo "ffmpeg failed; trying Streamlink pipeline..."
+              echo "ffmpeg failed; trying Streamlink..."
               if streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$URL" best -O | \
-                 ffmpeg -hide_banner -loglevel error \
-                        -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 \
-                        -rw_timeout 15000000 \
-                        -user_agent "Mozilla/5.0" \
-                        -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT"; then
+                 ffmpeg -hide_banner -loglevel error -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT"; then
                 echo "OK via Streamlink"
               else
-                echo "Both ffmpeg and Streamlink attempts failed."; exit 1
+                echo "Both ffmpeg and Streamlink failed."; exit 1
               fi
             fi
           else
-            echo "No m3u8 captured; attempting Streamlink on the page URL (may fail)..."
+            echo "No m3u8 captured; trying Streamlink on page URL..."
             PAGE_URL="${{ inputs.url }}"
             if streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$PAGE_URL" best -O | \
-               ffmpeg -hide_banner -loglevel error \
-                      -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 \
-                      -rw_timeout 15000000 \
-                      -user_agent "Mozilla/5.0" \
-                      -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT"; then
+               ffmpeg -hide_banner -loglevel error -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT"; then
               echo "OK via Streamlink (page URL)"
             else
-              echo "Fallback also failed."; exit 1
+              echo "Fallback failed."; exit 1
             fi
           fi
 
@@ -184,15 +186,66 @@ jobs:
           set -e
           FILE=$(ls -1 recordings/event-*.m4a | tail -n 1 || true)
           if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
-            echo "No recording found in ./recordings"
-            ls -l recordings || true
-            exit 1
+            echo "No recording found"; exit 1
           fi
           whisper "$FILE" --model "${{ inputs.model }}" \
             --task transcribe \
             --output_format all \
             --output_dir recordings \
             --verbose False
+
+      - name: (Optional) Install diarization deps
+        if: ${{ inputs.diarize == true }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
+          pip install pyannote.audio==3.* numpy==1.*
+
+      - name: (Optional) Diarize and merge with Whisper transcript
+        if: ${{ inputs.diarize == true }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MAX_SPK:  ${{ inputs.max_speakers }}
+        run: |
+          set -e
+          AUDIO=$(ls -1 recordings/event-*.m4a | tail -n 1)
+          WJSON=$(ls -1 recordings/*.json | head -n 1 || true)
+
+          if [ -z "$AUDIO" ]; then
+            echo "No audio file for diarization"; exit 1
+          fi
+          if [ -z "$HF_TOKEN" ]; then
+            echo "HF_TOKEN not set"; exit 1
+          fi
+
+          python <<'PY'
+          import os, json
+          from pathlib import Path
+          from pyannote.audio import Pipeline
+
+          audio = Path("recordings") / os.listdir("recordings")[0]
+          hf_token = os.environ["HF_TOKEN"]
+          num_speakers = int(os.environ.get("MAX_SPK","0")) or None
+
+          pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+          diarization = pipeline(str(audio), num_speakers=num_speakers)
+
+          with open("recordings/diarization.rttm","w") as f:
+              diarization.write_rttm(f)
+
+          # Try to merge with Whisper JSON
+          wjson_files = list(Path("recordings").glob("*.json"))
+          whisper_json = None
+          if wjson_files:
+              with open(wjson_files[0],"r",encoding="utf-8") as f: whisper_json=json.load(f)
+
+          def fmt(s): h,m=divmod(int(s),3600); m,s=divmod(m,60); return f"{h:02d}:{m:02d}:{s:02d}.000"
+
+          diarized_txt=[]
+          for turn,_,spk in diarization.itertracks(yield_label=True):
+              diarized_txt.append(f"{spk}: segment {turn.start:.1f}-{turn.end:.1f}")
+          Path("recordings/event-diarized.txt").write_text("\n".join(diarized_txt))
+          PY
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
