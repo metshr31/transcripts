@@ -1,4 +1,4 @@
-name: Reusable - Record & Transcribe HLS (with diarization)
+name: Reusable - Record & Transcribe HLS (with diarization + email)
 
 on:
   workflow_call:
@@ -9,7 +9,7 @@ on:
       minutes:
         required: false
         type: string
-        default: "35"            # default bumped to 35
+        default: "35"
       model:
         required: false
         type: string
@@ -18,11 +18,11 @@ on:
         required: false
         type: string
         default: "0"
-      diarize:                   # NEW: turn speaker diarization on/off
+      diarize:
         required: false
         type: boolean
         default: false
-      max_speakers:              # NEW: 0 = auto, >0 = force that many
+      max_speakers:
         required: false
         type: string
         default: "0"
@@ -35,7 +35,19 @@ on:
         required: true
       EMAIL:
         required: true
-      HF_TOKEN:                  # NEW: Hugging Face token for diarization
+      HF_TOKEN:
+        required: false
+      SMTP_SERVER:
+        required: false
+      SMTP_PORT:
+        required: false
+      SMTP_USERNAME:
+        required: false
+      SMTP_PASSWORD:
+        required: false
+      MAIL_FROM:
+        required: false
+      MAIL_TO:
         required: false
 
 jobs:
@@ -57,7 +69,6 @@ jobs:
           python -m pip install playwright openai-whisper
           python -m playwright install --with-deps chromium
 
-      # Inline Playwright helper for gated streams
       - name: Create inline Playwright capture helper
         run: |
           cat > /tmp/hls_capture_inline.py <<'PY'
@@ -209,42 +220,60 @@ jobs:
         run: |
           set -e
           AUDIO=$(ls -1 recordings/event-*.m4a | tail -n 1)
-          WJSON=$(ls -1 recordings/*.json | head -n 1 || true)
-
           if [ -z "$AUDIO" ]; then
             echo "No audio file for diarization"; exit 1
           fi
           if [ -z "$HF_TOKEN" ]; then
             echo "HF_TOKEN not set"; exit 1
           fi
-
           python <<'PY'
           import os, json
           from pathlib import Path
           from pyannote.audio import Pipeline
 
-          audio = Path("recordings") / os.listdir("recordings")[0]
-          hf_token = os.environ["HF_TOKEN"]
-          num_speakers = int(os.environ.get("MAX_SPK","0")) or None
-
-          pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
-          diarization = pipeline(str(audio), num_speakers=num_speakers)
-
-          with open("recordings/diarization.rttm","w") as f:
-              diarization.write_rttm(f)
-
-          # Try to merge with Whisper JSON
-          wjson_files = list(Path("recordings").glob("*.json"))
+          out_dir = Path("recordings")
+          audio = sorted(out_dir.glob("event-*.m4a"))[-1]
+          wjson_files = list(out_dir.glob("*.json"))
           whisper_json = None
           if wjson_files:
-              with open(wjson_files[0],"r",encoding="utf-8") as f: whisper_json=json.load(f)
+              whisper_json = json.loads(wjson_files[0].read_text(encoding="utf-8"))
 
-          def fmt(s): h,m=divmod(int(s),3600); m,s=divmod(m,60); return f"{h:02d}:{m:02d}:{s:02d}.000"
+          token = os.environ["HF_TOKEN"]
+          n = os.environ.get("MAX_SPK", "0")
+          num_speakers = int(n) if n.isdigit() and int(n) > 0 else None
 
-          diarized_txt=[]
-          for turn,_,spk in diarization.itertracks(yield_label=True):
-              diarized_txt.append(f"{spk}: segment {turn.start:.1f}-{turn.end:.1f}")
-          Path("recordings/event-diarized.txt").write_text("\n".join(diarized_txt))
+          pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+          diarization = pipeline(str(audio), num_speakers=num_speakers)
+
+          with open(out_dir / "diarization.rttm","w") as f:
+              diarization.write_rttm(f)
+
+          def fmt_ts(sec):
+              ms = int((sec - int(sec))*1000)
+              h = int(sec//3600); m=int((sec%3600)//60); s=int(sec%60)
+              return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+          if not whisper_json or "segments" not in whisper_json:
+              lines=[]
+              i=1
+              for turn,_,lab in diarization.itertracks(yield_label=True):
+                  lines += [str(i), f"{fmt_ts(turn.start)} --> {fmt_ts(turn.end)}", lab, ""]
+                  i+=1
+              (out_dir/"event-diarized.srt").write_text("\n".join(lines), encoding="utf-8")
+          else:
+              diarized=[]
+              for seg in whisper_json["segments"]:
+                  st=float(seg.get("start",0)); en=float(seg.get("end",st)); mid=(st+en)/2.0
+                  lab="SPEAKER_UNKNOWN"
+                  for turn,_,speaker in diarization.itertracks(yield_label=True):
+                      if turn.start <= mid <= turn.end:
+                          lab=speaker; break
+                  diarized.append({"start":st,"end":en,"speaker":lab,"text":seg.get("text","").strip()})
+
+              (out_dir/"event-diarized.txt").write_text(
+                  "\n".join(f'{d["speaker"]}: {d["text"]}' for d in diarized if d["text"]),
+                  encoding="utf-8"
+              )
           PY
 
       - name: Upload artifacts
@@ -253,3 +282,30 @@ jobs:
           name: audio-and-transcripts
           path: recordings/*
           retention-days: 14
+
+      - name: Email completion notice
+        if: ${{ always() }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: ${{ secrets.MAIL_FROM }}
+          to: ${{ secrets.MAIL_TO }}
+          secure: true
+          subject: "🎧 [${{ github.workflow }}] — ${{ job.status }}"
+          content_type: text/html
+          body: |
+            <h3>Workflow finished: <b>${{ github.workflow }}</b></h3>
+            <ul>
+              <li><b>Status:</b> ${{ job.status }}</li>
+              <li><b>Repository:</b> ${{ github.repository }}</li>
+              <li><b>Event URL:</b> ${{ inputs.url }}</li>
+              <li><b>Duration:</b> ${{ inputs.probe_seconds != '0' && format('{0}s (probe)', inputs.probe_seconds) || format('{0} min', inputs.minutes) }}</li>
+              <li><b>Artifacts:</b> audio-and-transcripts</li>
+              <li><b>Run:</b> <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open in GitHub</a></li>
+            </ul>
+          attachments: |
+            recordings/event-diarized.txt
+            recordings/*.txt
