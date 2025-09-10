@@ -6,7 +6,7 @@ on:
       minutes:
         description: "Recording length (minutes)"
         required: true
-        default: "35"
+        default: "43"
         type: string
       model:
         description: "Whisper model"
@@ -18,9 +18,9 @@ on:
         required: true
         default: "0"
         type: string
-  # CSX scheduled 5 minutes early: 11:25 AM ET on Sept 11, 2025 = 15:25 UTC
+  # CSX scheduled 5 minutes early: 11:20 AM ET on Sept 11, 2025 = 15:25 UTC
   schedule:
-    - cron: "25 15 11 9 *"
+    - cron: "20 15 11 9 *"
 
 jobs:
   call:
