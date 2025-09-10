@@ -33,8 +33,14 @@ jobs:
       diarize: true
       max_speakers: "0"
     secrets:
-      FIRST:     ${{ secrets.WERNER_FIRST }}
-      LAST:      ${{ secrets.WERNER_LAST }}
-      COMPANY:   ${{ secrets.WERNER_COMPANY }}
-      EMAIL:     ${{ secrets.WERNER_EMAIL }}
-      HF_TOKEN:  ${{ secrets.HF_TOKEN }}
+      FIRST:         ${{ secrets.WERNER_FIRST }}
+      LAST:          ${{ secrets.WERNER_LAST }}
+      COMPANY:       ${{ secrets.WERNER_COMPANY }}
+      EMAIL:         ${{ secrets.WERNER_EMAIL }}
+      HF_TOKEN:      ${{ secrets.HF_TOKEN }}
+      SMTP_SERVER:   ${{ secrets.SMTP_SERVER }}
+      SMTP_PORT:     ${{ secrets.SMTP_PORT }}
+      SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      MAIL_FROM:     ${{ secrets.MAIL_FROM }}
+      MAIL_TO:       ${{ secrets.MAIL_TO }}
