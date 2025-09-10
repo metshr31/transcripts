@@ -6,7 +6,7 @@ on:
       minutes:
         description: "Recording length (minutes)"
         required: true
-        default: "35"
+        default: "43"
         type: string
       model:
         description: "Whisper model"
@@ -18,9 +18,9 @@ on:
         required: true
         default: "0"
         type: string
-  # Schneider scheduled 5 minutes early: 11:40 AM ET on Sept 11, 2025 = 15:40 UTC
+  # Schneider scheduled 5 minutes early: 11:35 AM ET on Sept 11, 2025 = 15:40 UTC
   schedule:
-    - cron: "40 15 11 9 *"
+    - cron: "35 15 11 9 *"
 
 jobs:
   call:
