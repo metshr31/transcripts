@@ -1,4 +1,4 @@
-name: Reusable - Record & Transcribe HLS (with diarization + email)
+name: Reusable - Record & Transcribe HLS (with diarization + email + screenshot)
 
 on:
   workflow_call:
@@ -69,32 +69,64 @@ jobs:
           python -m pip install playwright openai-whisper
           python -m playwright install --with-deps chromium
 
-      - name: Create inline Playwright capture helper
+      - name: Create inline Playwright capture helper (with screenshot)
         run: |
           cat > /tmp/hls_capture_inline.py <<'PY'
-          import os, json, asyncio, re
+          import os, json, asyncio, re, time, pathlib
           from urllib.parse import urlparse
           from playwright.async_api import async_playwright
+
           URL=os.environ["EVENT_URL"]; FIRST=os.environ["FIRST"]; LAST=os.environ["LAST"]; COMPANY=os.environ["COMPANY"]; EMAIL=os.environ["EMAIL"]
           LABELS={"First Name":FIRST,"Last Name":LAST,"Company":COMPANY,"Email":EMAIL}
           M3U8_RE=re.compile(r"\.m3u8(\?.*)?$", re.IGNORECASE)
+
+          async def try_click_play(frame):
+              selectors = [
+                  ".vjs-big-play-button",
+                  "button[aria-label='Play']",
+                  "button:has-text('Play')",
+                  "div[role='button']:has-text('Play')",
+                  "button.ytp-large-play-button"
+              ]
+              for sel in selectors:
+                  try:
+                      el = frame.locator(sel)
+                      if await el.count() > 0:
+                          await el.first.click(timeout=1000)
+                          return True
+                  except: pass
+              # spacebar can start playback on some players
+              try:
+                  await frame.press("body", " ")
+              except: pass
+              return False
+
           async def main():
+              pathlib.Path("recordings").mkdir(parents=True, exist_ok=True)
               async with async_playwright() as p:
-                  b=await p.chromium.launch(headless=True); c=await b.new_context(); pg=await c.new_page()
+                  b=await p.chromium.launch(headless=True)
+                  ctx=await b.new_context()
+                  pg=await ctx.new_page()
                   found={"url":None,"headers":{}}
-                  async def on_resp(r):
-                      try:
-                          u=r.url
-                          if M3U8_RE.search(u) and not found["url"]:
-                              found["url"]=u
-                              found["headers"]["Referer"]=pg.url
-                              pr=urlparse(pg.url); found["headers"]["Origin"]=f"{pr.scheme}://{pr.netloc}"
-                      except: pass
-                  pg.on("response", on_resp)
+
+                  def maybe_take(u, frame_url):
+                      if M3U8_RE.search(u) and not found["url"]:
+                          found["url"]=u
+                          found["headers"]["Referer"]=pg.url
+                          pr=urlparse(pg.url); found["headers"]["Origin"]=f"{pr.scheme}://{pr.netloc}"
+
+                  # Watch top-level and frames
+                  pg.on("request", lambda r: maybe_take(r.url, pg.url))
+                  pg.on("response", lambda r: maybe_take(r.url, pg.url))
+
                   await pg.goto(URL, wait_until="domcontentloaded")
+
+                  # Fill by labels
                   for lab,val in LABELS.items():
                       try: await pg.get_by_label(lab, exact=True).fill(val)
                       except: pass
+
+                  # Generic fallbacks
                   async def tf(sel,val):
                       try: await pg.fill(sel,val); return True
                       except: return False
@@ -102,22 +134,57 @@ jobs:
                   await tf("input[name='lastName']",LAST);  await tf("input[name='lastname']",LAST);  await tf("input[placeholder='Last Name']",LAST)
                   await tf("input[name='company']",COMPANY); await tf("input[placeholder='Company']",COMPANY)
                   await tf("input[name='email']",EMAIL);   await tf("input[type='email']",EMAIL)
+
+                  # Submit
                   for sel in ["button[type='submit']","input[type='submit']","button:has-text('Enter')","button:has-text('Register')","button:has-text('Log In')","button:has-text('Watch')"]:
-                      try: await pg.click(sel); break
+                      try: await pg.click(sel, timeout=1000); break
                       except: pass
-                  await pg.wait_for_load_state("networkidle", timeout=60000)
-                  for _ in range(60):
-                      if found["url"]: break
+
+                  # Hook existing frames
+                  for fr in pg.frames:
+                      fr.on("request", lambda r: maybe_take(r.url, fr.url))
+                      fr.on("response", lambda r: maybe_take(r.url, fr.url))
+                  # Hook future frames
+                  pg.on("frameattached", lambda fr: (fr.on("request", lambda r: maybe_take(r.url, fr.url)),
+                                                     fr.on("response", lambda r: maybe_take(r.url, fr.url))))
+
+                  # Let things settle
+                  try:
+                      await pg.wait_for_load_state("networkidle", timeout=120000)
+                  except: pass
+
+                  # Click Play in all frames
+                  for fr in pg.frames:
+                      try: await try_click_play(fr)
+                      except: pass
+
+                  # Wait up to 3 minutes for a manifest to show
+                  t0=time.time()
+                  while not found["url"] and (time.time()-t0)<180:
                       await asyncio.sleep(1)
-                  ck=await c.cookies()
-                  cookie="; ".join(f"{x['name']}={x['value']}" for x in ck) if ck else ""
+
+                  # Screenshot for debugging (always)
+                  try:
+                      await pg.screenshot(path="recordings/page_after_capture.jpg", full_page=True)
+                  except: pass
+                  try:
+                      # Save top-level HTML too (sometimes helpful)
+                      html = await pg.content()
+                      open("recordings/page_after_capture.html","w",encoding="utf-8").write(html)
+                  except: pass
+
+                  # Cookies
+                  ck=await ctx.cookies()
+                  cookie="; ".join(f"{c['name']}={c['value']}" for c in ck) if ck else ""
                   json.dump({"m3u8_url":found["url"],"headers":found["headers"],"cookies":cookie}, open("session_info.json","w"))
-                  print("Captured:", json.dumps({"has_m3u8": bool(found["url"])}))
+                  print("Captured:", json.dumps({"has_m3u8": bool(found['url'])}))
                   await b.close()
-          if __name__=="__main__": asyncio.run(main())
+
+          if __name__=="__main__":
+              asyncio.run(main())
           PY
 
-      - name: Login & capture HLS info (auto-skip for .m3u8)
+      - name: Login & capture HLS info
         env:
           EVENT_URL: ${{ inputs.url }}
           FIRST:     ${{ secrets.FIRST }}
@@ -137,10 +204,11 @@ jobs:
             echo "Not a direct .m3u8; using Playwright to capture."
             python /tmp/hls_capture_inline.py
           fi
-          echo "== session_info.json (sanitized) =="
-          cat session_info.json | jq '{m3u8_url, headers: (.headers|keys), has_cookies: (.cookies|length>0)}'
+          echo "== session_info.json =="
+          cat session_info.json || true
+          echo "== If present, screenshot saved to recordings/page_after_capture.jpg and HTML to recordings/page_after_capture.html =="
 
-      - name: Record audio (ffmpeg with reconnect; Streamlink fallback)
+      - name: Record audio
         id: rec
         env:
           MINUTES: ${{ inputs.minutes }}
@@ -164,68 +232,42 @@ jobs:
           [ -n "$REF" ] && HDRS="${HDRS}Referer: ${REF}\r\n"
           [ -n "$ORG" ] && HDRS="${HDRS}Origin: ${ORG}\r\n"
 
-          RECORD_CMD='ffmpeg -hide_banner -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -rw_timeout 15000000 -user_agent "Mozilla/5.0" -headers "$HDRS" -i "$URL" -t $DURATION -vn -c:a aac -b:a 128k "$OUT"'
-
           if [ -n "$URL" ] && [ "$URL" != "null" ]; then
-            echo "Trying ffmpeg directly..."
-            if eval $RECORD_CMD; then
-              echo "OK via ffmpeg"
-            else
-              echo "ffmpeg failed; trying Streamlink..."
-              if streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$URL" best -O | \
-                 ffmpeg -hide_banner -loglevel error -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT"; then
-                echo "OK via Streamlink"
-              else
-                echo "Both ffmpeg and Streamlink failed."; exit 1
-              fi
-            fi
+            ffmpeg -hide_banner -loglevel error \
+              -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 \
+              -rw_timeout 15000000 -user_agent "Mozilla/5.0" \
+              -headers "$HDRS" -i "$URL" -t $DURATION \
+              -vn -c:a aac -b:a 128k "$OUT" || exit 1
           else
-            echo "No m3u8 captured; trying Streamlink on page URL..."
+            echo "No m3u8 captured; trying Streamlink..."
             PAGE_URL="${{ inputs.url }}"
-            if streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$PAGE_URL" best -O | \
-               ffmpeg -hide_banner -loglevel error -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT"; then
-              echo "OK via Streamlink (page URL)"
-            else
-              echo "Fallback failed."; exit 1
-            fi
+            streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$PAGE_URL" best -O | \
+              ffmpeg -hide_banner -loglevel error -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT" || exit 1
           fi
 
           echo "out_file=$OUT" >> $GITHUB_OUTPUT
 
-      - name: Transcribe with Whisper (CLI)
+      - name: Transcribe with Whisper
         run: |
-          set -e
-          FILE=$(ls -1 recordings/event-*.m4a | tail -n 1 || true)
-          if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
-            echo "No recording found"; exit 1
-          fi
+          FILE=$(ls -1 recordings/event-*.m4a | tail -n 1)
           whisper "$FILE" --model "${{ inputs.model }}" \
             --task transcribe \
             --output_format all \
             --output_dir recordings \
             --verbose False
 
-      - name: (Optional) Install diarization deps
+      - name: Install diarization deps
         if: ${{ inputs.diarize == true }}
         run: |
-          python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
           pip install pyannote.audio==3.* numpy==1.*
 
-      - name: (Optional) Diarize and merge with Whisper transcript
+      - name: Run diarization
         if: ${{ inputs.diarize == true }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MAX_SPK:  ${{ inputs.max_speakers }}
         run: |
-          set -e
-          AUDIO=$(ls -1 recordings/event-*.m4a | tail -n 1)
-          if [ -z "$AUDIO" ]; then
-            echo "No audio file for diarization"; exit 1
-          fi
-          if [ -z "$HF_TOKEN" ]; then
-            echo "HF_TOKEN not set"; exit 1
-          fi
           python <<'PY'
           import os, json
           from pathlib import Path
@@ -233,47 +275,16 @@ jobs:
 
           out_dir = Path("recordings")
           audio = sorted(out_dir.glob("event-*.m4a"))[-1]
-          wjson_files = list(out_dir.glob("*.json"))
-          whisper_json = None
-          if wjson_files:
-              whisper_json = json.loads(wjson_files[0].read_text(encoding="utf-8"))
-
           token = os.environ["HF_TOKEN"]
-          n = os.environ.get("MAX_SPK", "0")
+          n = os.environ.get("MAX_SPK","0")
           num_speakers = int(n) if n.isdigit() and int(n) > 0 else None
 
           pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
           diarization = pipeline(str(audio), num_speakers=num_speakers)
 
-          with open(out_dir / "diarization.rttm","w") as f:
-              diarization.write_rttm(f)
-
-          def fmt_ts(sec):
-              ms = int((sec - int(sec))*1000)
-              h = int(sec//3600); m=int((sec%3600)//60); s=int(sec%60)
-              return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-          if not whisper_json or "segments" not in whisper_json:
-              lines=[]
-              i=1
-              for turn,_,lab in diarization.itertracks(yield_label=True):
-                  lines += [str(i), f"{fmt_ts(turn.start)} --> {fmt_ts(turn.end)}", lab, ""]
-                  i+=1
-              (out_dir/"event-diarized.srt").write_text("\n".join(lines), encoding="utf-8")
-          else:
-              diarized=[]
-              for seg in whisper_json["segments"]:
-                  st=float(seg.get("start",0)); en=float(seg.get("end",st)); mid=(st+en)/2.0
-                  lab="SPEAKER_UNKNOWN"
-                  for turn,_,speaker in diarization.itertracks(yield_label=True):
-                      if turn.start <= mid <= turn.end:
-                          lab=speaker; break
-                  diarized.append({"start":st,"end":en,"speaker":lab,"text":seg.get("text","").strip()})
-
-              (out_dir/"event-diarized.txt").write_text(
-                  "\n".join(f'{d["speaker"]}: {d["text"]}' for d in diarized if d["text"]),
-                  encoding="utf-8"
-              )
+          with open(out_dir / "event-diarized.txt","w") as f:
+              for turn,_,speaker in diarization.itertracks(yield_label=True):
+                  f.write(f"{speaker} [{turn.start:.1f}-{turn.end:.1f}]\n")
           PY
 
       - name: Upload artifacts
@@ -295,8 +306,7 @@ jobs:
           to: ${{ secrets.MAIL_TO }}
           secure: true
           subject: "🎧 [${{ github.workflow }}] — ${{ job.status }}"
-          content_type: text/html
-          body: |
+          html_body: |
             <h3>Workflow finished: <b>${{ github.workflow }}</b></h3>
             <ul>
               <li><b>Status:</b> ${{ job.status }}</li>
@@ -307,5 +317,6 @@ jobs:
               <li><b>Run:</b> <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open in GitHub</a></li>
             </ul>
           attachments: |
+            recordings/page_after_capture.jpg
             recordings/event-diarized.txt
             recordings/*.txt
