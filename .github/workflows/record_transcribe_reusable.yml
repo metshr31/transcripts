@@ -1,4 +1,4 @@
-name: Reusable - Record & Transcribe HLS (with diarization + email + screenshot)
+name: Reusable - Record & Transcribe HLS (hardened + email + screenshot)
 
 on:
   workflow_call:
@@ -26,6 +26,10 @@ on:
         required: false
         type: string
         default: "0"
+      capture_wait_seconds:          # NEW: how long to wait for a manifest (HLS/DASH)
+        required: false
+        type: string
+        default: "180"
     secrets:
       FIRST:
         required: true
@@ -69,16 +73,26 @@ jobs:
           python -m pip install playwright openai-whisper
           python -m playwright install --with-deps chromium
 
-      - name: Create inline Playwright capture helper (with screenshot)
+      - name: Create inline Playwright capture helper (HLS/DASH + headers + screenshot)
         run: |
           cat > /tmp/hls_capture_inline.py <<'PY'
           import os, json, asyncio, re, time, pathlib
           from urllib.parse import urlparse
           from playwright.async_api import async_playwright
 
-          URL=os.environ["EVENT_URL"]; FIRST=os.environ["FIRST"]; LAST=os.environ["LAST"]; COMPANY=os.environ["COMPANY"]; EMAIL=os.environ["EMAIL"]
+          URL=os.environ["EVENT_URL"]
+          FIRST=os.environ["FIRST"]; LAST=os.environ["LAST"]
+          COMPANY=os.environ["COMPANY"]; EMAIL=os.environ["EMAIL"]
+          WAIT=int(os.environ.get("CAPTURE_WAIT","180"))
+
           LABELS={"First Name":FIRST,"Last Name":LAST,"Company":COMPANY,"Email":EMAIL}
-          M3U8_RE=re.compile(r"\.m3u8(\?.*)?$", re.IGNORECASE)
+          MANIFEST_RE=re.compile(r"\.(m3u8|mpd)(\?.*)?$", re.IGNORECASE)
+
+          def k(v, n):
+              # normalize header name case-insensitively
+              for key in v.keys():
+                  if key.lower() == n.lower(): return key
+              return None
 
           async def try_click_play(frame):
               selectors = [
@@ -86,7 +100,7 @@ jobs:
                   "button[aria-label='Play']",
                   "button:has-text('Play')",
                   "div[role='button']:has-text('Play')",
-                  "button.ytp-large-play-button"
+                  "button.ytp-large-play-button",
               ]
               for sel in selectors:
                   try:
@@ -95,9 +109,12 @@ jobs:
                           await el.first.click(timeout=1000)
                           return True
                   except: pass
-              # spacebar can start playback on some players
+              # as a last resort, try to play() a <video> element muted
               try:
-                  await frame.press("body", " ")
+                  await frame.evaluate("""() => {
+                    const v = document.querySelector('video');
+                    if (v) { v.muted = true; v.play().catch(()=>{}); }
+                  }""")
               except: pass
               return False
 
@@ -107,26 +124,33 @@ jobs:
                   b=await p.chromium.launch(headless=True)
                   ctx=await b.new_context()
                   pg=await ctx.new_page()
-                  found={"url":None,"headers":{}}
+                  found={"url":None,"headers":{}, "from":"", "when":None}
 
-                  def maybe_take(u, frame_url):
-                      if M3U8_RE.search(u) and not found["url"]:
-                          found["url"]=u
+                  def take_from_request(req, frame_url):
+                      u=req.url
+                      if MANIFEST_RE.search(u) and not found["url"]:
+                          found["url"]=u; found["from"]=frame_url; found["when"]=time.time()
+                          # copy selective headers from the request
+                          hdr=req.headers or {}
+                          for key in ["authorization","x-auth-token","x-amz-security-token","user-agent"]:
+                              real=k(hdr,key)
+                              if real: found["headers"][real]=hdr[real]
+                          # referer/origin from top page
                           found["headers"]["Referer"]=pg.url
                           pr=urlparse(pg.url); found["headers"]["Origin"]=f"{pr.scheme}://{pr.netloc}"
 
-                  # Watch top-level and frames
-                  pg.on("request", lambda r: maybe_take(r.url, pg.url))
-                  pg.on("response", lambda r: maybe_take(r.url, pg.url))
+                  # top-level listeners
+                  pg.on("request", lambda r: take_from_request(r, pg.url))
+                  pg.on("response", lambda r: take_from_request(r.request, pg.url))
 
                   await pg.goto(URL, wait_until="domcontentloaded")
 
-                  # Fill by labels
+                  # Fill simple label fields if present
                   for lab,val in LABELS.items():
                       try: await pg.get_by_label(lab, exact=True).fill(val)
                       except: pass
 
-                  # Generic fallbacks
+                  # Fallback selectors
                   async def tf(sel,val):
                       try: await pg.fill(sel,val); return True
                       except: return False
@@ -135,40 +159,37 @@ jobs:
                   await tf("input[name='company']",COMPANY); await tf("input[placeholder='Company']",COMPANY)
                   await tf("input[name='email']",EMAIL);   await tf("input[type='email']",EMAIL)
 
-                  # Submit
+                  # Submit if a button looks plausible
                   for sel in ["button[type='submit']","input[type='submit']","button:has-text('Enter')","button:has-text('Register')","button:has-text('Log In')","button:has-text('Watch')"]:
                       try: await pg.click(sel, timeout=1000); break
                       except: pass
 
-                  # Hook existing frames
+                  # hook existing and future frames
                   for fr in pg.frames:
-                      fr.on("request", lambda r: maybe_take(r.url, fr.url))
-                      fr.on("response", lambda r: maybe_take(r.url, fr.url))
-                  # Hook future frames
-                  pg.on("frameattached", lambda fr: (fr.on("request", lambda r: maybe_take(r.url, fr.url)),
-                                                     fr.on("response", lambda r: maybe_take(r.url, fr.url))))
+                      fr.on("request", lambda r, f=fr: take_from_request(r, f.url))
+                      fr.on("response", lambda r, f=fr: take_from_request(r.request, f.url))
+                  pg.on("frameattached", lambda fr: (fr.on("request", lambda r, f=fr: take_from_request(r, f.url)),
+                                                     fr.on("response", lambda r, f=fr: take_from_request(r.request, f.url))))
 
-                  # Let things settle
                   try:
                       await pg.wait_for_load_state("networkidle", timeout=120000)
                   except: pass
 
-                  # Click Play in all frames
+                  # click play in every frame
                   for fr in pg.frames:
                       try: await try_click_play(fr)
                       except: pass
 
-                  # Wait up to 3 minutes for a manifest to show
+                  # wait for manifest up to WAIT seconds
                   t0=time.time()
-                  while not found["url"] and (time.time()-t0)<180:
+                  while not found["url"] and (time.time()-t0)<WAIT:
                       await asyncio.sleep(1)
 
-                  # Screenshot for debugging (always)
+                  # Debug artifacts
                   try:
                       await pg.screenshot(path="recordings/page_after_capture.jpg", full_page=True)
                   except: pass
                   try:
-                      # Save top-level HTML too (sometimes helpful)
                       html = await pg.content()
                       open("recordings/page_after_capture.html","w",encoding="utf-8").write(html)
                   except: pass
@@ -176,100 +197,119 @@ jobs:
                   # Cookies
                   ck=await ctx.cookies()
                   cookie="; ".join(f"{c['name']}={c['value']}" for c in ck) if ck else ""
-                  json.dump({"m3u8_url":found["url"],"headers":found["headers"],"cookies":cookie}, open("session_info.json","w"))
-                  print("Captured:", json.dumps({"has_m3u8": bool(found['url'])}))
+                  with open("session_info.json","w") as f:
+                      json.dump({"manifest_url":found["url"],"headers":found["headers"],"cookies":cookie,"source_frame":found["from"],"captured_at":found["when"]}, f)
+                  print("Captured:", json.dumps({"has_manifest": bool(found["url"])}))
                   await b.close()
 
           if __name__=="__main__":
               asyncio.run(main())
           PY
 
-      - name: Login & capture HLS info
+      - name: Login & capture manifest (HLS .m3u8 or DASH .mpd)
         env:
           EVENT_URL: ${{ inputs.url }}
           FIRST:     ${{ secrets.FIRST }}
           LAST:      ${{ secrets.LAST }}
           COMPANY:   ${{ secrets.COMPANY }}
           EMAIL:     ${{ secrets.EMAIL }}
+          CAPTURE_WAIT: ${{ inputs.capture_wait_seconds }}
         run: |
-          if echo "$EVENT_URL" | grep -Eiq '\.m3u8(\?.*)?$'; then
-            echo "Direct .m3u8 detected; skipping Playwright."
+          if echo "$EVENT_URL" | grep -Eiq '\.(m3u8|mpd)(\?.*)?$'; then
+            echo "Direct manifest detected; skipping Playwright."
             printf '%s\n' \
               '{' \
-              "  \"m3u8_url\": \"${EVENT_URL}\"," \
+              "  \"manifest_url\": \"${EVENT_URL}\"," \
               '  "headers": {},' \
               '  "cookies": ""' \
               '}' > session_info.json
           else
-            echo "Not a direct .m3u8; using Playwright to capture."
+            echo "Using Playwright to capture manifest..."
             python /tmp/hls_capture_inline.py
           fi
           echo "== session_info.json =="
           cat session_info.json || true
-          echo "== If present, screenshot saved to recordings/page_after_capture.jpg and HTML to recordings/page_after_capture.html =="
+          # Keep a copy with artifacts
+          mkdir -p recordings
+          cp -f session_info.json recordings/session_info.json || true
+          echo "== If present, screenshot/HTML saved to recordings/ =="
+          ls -l recordings || true
 
-      - name: Record audio
+      - name: Record audio (ffmpeg, Streamlink fallback)
         id: rec
         env:
           MINUTES: ${{ inputs.minutes }}
           PROBE:   ${{ inputs.probe_seconds }}
         run: |
-          mkdir -p recordings
-          URL=$(jq -r '.m3u8_url' session_info.json)
+          URL=$(jq -r '.manifest_url' session_info.json)
+          CK=$(jq -r '.cookies // empty' session_info.json)
           REF=$(jq -r '.headers.Referer // empty' session_info.json)
           ORG=$(jq -r '.headers.Origin // empty' session_info.json)
-          CK=$(jq -r '.cookies // empty' session_info.json)
 
-          if [ -n "$PROBE" ] && [ "$PROBE" != "0" ]; then
-            DURATION=$PROBE
-          else
-            DURATION=$((MINUTES*60))
-          fi
+          if [ -n "$PROBE" ] && [ "$PROBE" != "0" ]; then DURATION=$PROBE; else DURATION=$((MINUTES*60)); fi
 
-          TS=$(date -u +"%Y%m%d-%H%M%S"); OUT="recordings/event-${TS}.m4a"
+          TS=$(date -u +"%Y%m%d-%H%M%S")
+          OUT="recordings/event-${TS}.m4a"
+          mkdir -p recordings
+
+          # Build headers from session_info (cookies + referer/origin + any captured)
           HDRS=""
           [ -n "$CK" ]  && HDRS="${HDRS}Cookie: ${CK}\r\n"
           [ -n "$REF" ] && HDRS="${HDRS}Referer: ${REF}\r\n"
           [ -n "$ORG" ] && HDRS="${HDRS}Origin: ${ORG}\r\n"
+          # Add any extra captured headers (e.g., Authorization)
+          jq -r '.headers | to_entries[] | "\(.key): \(.value)\r\n"' session_info.json > /tmp/extra_hdrs.txt || true
+          [ -s /tmp/extra_hdrs.txt ] && HDRS="${HDRS}$(cat /tmp/extra_hdrs.txt)"
 
           if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+            echo "Recording via ffmpeg…"
             ffmpeg -hide_banner -loglevel error \
               -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 \
               -rw_timeout 15000000 -user_agent "Mozilla/5.0" \
               -headers "$HDRS" -i "$URL" -t $DURATION \
-              -vn -c:a aac -b:a 128k "$OUT" || exit 1
+              -vn -c:a aac -b:a 128k "$OUT" || {
+                echo "ffmpeg failed; trying Streamlink…"
+                streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$URL" best -O | \
+                  ffmpeg -hide_banner -loglevel error -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT" || exit 1
+              }
           else
-            echo "No m3u8 captured; trying Streamlink..."
+            echo "No manifest captured; trying Streamlink on page URL…"
             PAGE_URL="${{ inputs.url }}"
             streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$PAGE_URL" best -O | \
               ffmpeg -hide_banner -loglevel error -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT" || exit 1
           fi
 
           echo "out_file=$OUT" >> $GITHUB_OUTPUT
+          ls -l recordings || true
 
-      - name: Transcribe with Whisper
+      - name: Transcribe with Whisper (CLI)
         run: |
-          FILE=$(ls -1 recordings/event-*.m4a | tail -n 1)
+          set -e
+          FILE=$(ls -1 recordings/event-*.m4a | tail -n 1 || true)
+          if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+            echo "No recording found"; exit 1
+          fi
           whisper "$FILE" --model "${{ inputs.model }}" \
             --task transcribe \
             --output_format all \
             --output_dir recordings \
             --verbose False
 
-      - name: Install diarization deps
+      - name: (Optional) Install diarization deps
         if: ${{ inputs.diarize == true }}
         run: |
+          python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
           pip install pyannote.audio==3.* numpy==1.*
 
-      - name: Run diarization
+      - name: (Optional) Diarize and write simple speaker file
         if: ${{ inputs.diarize == true }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MAX_SPK:  ${{ inputs.max_speakers }}
         run: |
           python <<'PY'
-          import os, json
+          import os
           from pathlib import Path
           from pyannote.audio import Pipeline
 
@@ -318,5 +358,7 @@ jobs:
             </ul>
           attachments: |
             recordings/page_after_capture.jpg
+            recordings/page_after_capture.html
+            recordings/session_info.json
             recordings/event-diarized.txt
             recordings/*.txt
