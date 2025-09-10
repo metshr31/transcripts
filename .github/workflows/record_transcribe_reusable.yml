@@ -26,7 +26,7 @@ on:
         required: false
         type: string
         default: "0"
-      capture_wait_seconds:          # NEW: how long to wait for a manifest (HLS/DASH)
+      capture_wait_seconds:
         required: false
         type: string
         default: "180"
@@ -41,17 +41,12 @@ on:
         required: true
       HF_TOKEN:
         required: false
-      SMTP_SERVER:
+      # Yahoo SMTP secrets (SSL 465)
+      YAHOO_EMAIL:
         required: false
-      SMTP_PORT:
+      YAHOO_APP_PASSWORD:
         required: false
-      SMTP_USERNAME:
-        required: false
-      SMTP_PASSWORD:
-        required: false
-      MAIL_FROM:
-        required: false
-      MAIL_TO:
+      TO_EMAIL:
         required: false
 
 jobs:
@@ -88,10 +83,9 @@ jobs:
           LABELS={"First Name":FIRST,"Last Name":LAST,"Company":COMPANY,"Email":EMAIL}
           MANIFEST_RE=re.compile(r"\.(m3u8|mpd)(\?.*)?$", re.IGNORECASE)
 
-          def k(v, n):
-              # normalize header name case-insensitively
-              for key in v.keys():
-                  if key.lower() == n.lower(): return key
+          def header_key(dct, name):
+              for k in dct.keys():
+                  if k.lower()==name.lower(): return k
               return None
 
           async def try_click_play(frame):
@@ -109,7 +103,6 @@ jobs:
                           await el.first.click(timeout=1000)
                           return True
                   except: pass
-              # as a last resort, try to play() a <video> element muted
               try:
                   await frame.evaluate("""() => {
                     const v = document.querySelector('video');
@@ -130,27 +123,22 @@ jobs:
                       u=req.url
                       if MANIFEST_RE.search(u) and not found["url"]:
                           found["url"]=u; found["from"]=frame_url; found["when"]=time.time()
-                          # copy selective headers from the request
                           hdr=req.headers or {}
                           for key in ["authorization","x-auth-token","x-amz-security-token","user-agent"]:
-                              real=k(hdr,key)
+                              real=header_key(hdr,key)
                               if real: found["headers"][real]=hdr[real]
-                          # referer/origin from top page
                           found["headers"]["Referer"]=pg.url
                           pr=urlparse(pg.url); found["headers"]["Origin"]=f"{pr.scheme}://{pr.netloc}"
 
-                  # top-level listeners
                   pg.on("request", lambda r: take_from_request(r, pg.url))
                   pg.on("response", lambda r: take_from_request(r.request, pg.url))
 
                   await pg.goto(URL, wait_until="domcontentloaded")
 
-                  # Fill simple label fields if present
                   for lab,val in LABELS.items():
                       try: await pg.get_by_label(lab, exact=True).fill(val)
                       except: pass
 
-                  # Fallback selectors
                   async def tf(sel,val):
                       try: await pg.fill(sel,val); return True
                       except: return False
@@ -159,12 +147,10 @@ jobs:
                   await tf("input[name='company']",COMPANY); await tf("input[placeholder='Company']",COMPANY)
                   await tf("input[name='email']",EMAIL);   await tf("input[type='email']",EMAIL)
 
-                  # Submit if a button looks plausible
                   for sel in ["button[type='submit']","input[type='submit']","button:has-text('Enter')","button:has-text('Register')","button:has-text('Log In')","button:has-text('Watch')"]:
                       try: await pg.click(sel, timeout=1000); break
                       except: pass
 
-                  # hook existing and future frames
                   for fr in pg.frames:
                       fr.on("request", lambda r, f=fr: take_from_request(r, f.url))
                       fr.on("response", lambda r, f=fr: take_from_request(r.request, f.url))
@@ -175,17 +161,14 @@ jobs:
                       await pg.wait_for_load_state("networkidle", timeout=120000)
                   except: pass
 
-                  # click play in every frame
                   for fr in pg.frames:
                       try: await try_click_play(fr)
                       except: pass
 
-                  # wait for manifest up to WAIT seconds
                   t0=time.time()
                   while not found["url"] and (time.time()-t0)<WAIT:
                       await asyncio.sleep(1)
 
-                  # Debug artifacts
                   try:
                       await pg.screenshot(path="recordings/page_after_capture.jpg", full_page=True)
                   except: pass
@@ -194,7 +177,6 @@ jobs:
                       open("recordings/page_after_capture.html","w",encoding="utf-8").write(html)
                   except: pass
 
-                  # Cookies
                   ck=await ctx.cookies()
                   cookie="; ".join(f"{c['name']}={c['value']}" for c in ck) if ck else ""
                   with open("session_info.json","w") as f:
@@ -229,10 +211,9 @@ jobs:
           fi
           echo "== session_info.json =="
           cat session_info.json || true
-          # Keep a copy with artifacts
           mkdir -p recordings
           cp -f session_info.json recordings/session_info.json || true
-          echo "== If present, screenshot/HTML saved to recordings/ =="
+          echo "== Artifacts in recordings/ (if present) =="
           ls -l recordings || true
 
       - name: Record audio (ffmpeg, Streamlink fallback)
@@ -252,12 +233,10 @@ jobs:
           OUT="recordings/event-${TS}.m4a"
           mkdir -p recordings
 
-          # Build headers from session_info (cookies + referer/origin + any captured)
           HDRS=""
           [ -n "$CK" ]  && HDRS="${HDRS}Cookie: ${CK}\r\n"
           [ -n "$REF" ] && HDRS="${HDRS}Referer: ${REF}\r\n"
           [ -n "$ORG" ] && HDRS="${HDRS}Origin: ${ORG}\r\n"
-          # Add any extra captured headers (e.g., Authorization)
           jq -r '.headers | to_entries[] | "\(.key): \(.value)\r\n"' session_info.json > /tmp/extra_hdrs.txt || true
           [ -s /tmp/extra_hdrs.txt ] && HDRS="${HDRS}$(cat /tmp/extra_hdrs.txt)"
 
@@ -334,28 +313,27 @@ jobs:
           path: recordings/*
           retention-days: 14
 
-      - name: Email completion notice
+      - name: Email results (Yahoo SSL 465)
         if: ${{ always() }}
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          from: ${{ secrets.MAIL_FROM }}
-          to: ${{ secrets.MAIL_TO }}
+          server_address: smtp.mail.yahoo.com
+          server_port: 465
           secure: true
-          subject: "🎧 [${{ github.workflow }}] — ${{ job.status }}"
-          html_body: |
-            <h3>Workflow finished: <b>${{ github.workflow }}</b></h3>
-            <ul>
-              <li><b>Status:</b> ${{ job.status }}</li>
-              <li><b>Repository:</b> ${{ github.repository }}</li>
-              <li><b>Event URL:</b> ${{ inputs.url }}</li>
-              <li><b>Duration:</b> ${{ inputs.probe_seconds != '0' && format('{0}s (probe)', inputs.probe_seconds) || format('{0} min', inputs.minutes) }}</li>
-              <li><b>Artifacts:</b> audio-and-transcripts</li>
-              <li><b>Run:</b> <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">Open in GitHub</a></li>
-            </ul>
+          username: ${{ secrets.YAHOO_EMAIL }}
+          password: ${{ secrets.YAHOO_APP_PASSWORD }}
+          from:     ${{ secrets.YAHOO_EMAIL }}
+          to:       ${{ secrets.TO_EMAIL }}
+          subject: "🎧 [${{ github.workflow }}] — ${{ job.status }} (run #${{ github.run_number }})"
+          body: |
+            Workflow: ${{ github.workflow }}
+            Status:   ${{ job.status }}
+            Repo:     ${{ github.repository }}
+            Event URL: ${{ inputs.url }}
+            Duration:  ${{ inputs.probe_seconds != '0' && format('{0}s (probe)', inputs.probe_seconds) || format('{0} min', inputs.minutes) }}
+            Run:      https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Attachments include the transcript and capture debug artifacts (if present).
           attachments: |
             recordings/page_after_capture.jpg
             recordings/page_after_capture.html
