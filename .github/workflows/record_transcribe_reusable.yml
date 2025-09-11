@@ -1,342 +1,171 @@
-name: Reusable - Record & Transcribe HLS (hardened + email + screenshot)
+name: Record & Transcribe (HLS)
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
-      url:
+      page_url:
+        description: "Public webcast/player PAGE URL (not the .m3u8)"
         required: true
-        type: string
-      minutes:
+      duration_sec:
+        description: "Optional hard stop in seconds (leave blank to let stream end naturally)"
         required: false
-        type: string
-        default: "35"
-      model:
-        required: false
-        type: string
-        default: "small"
-      probe_seconds:
-        required: false
-        type: string
-        default: "0"
-      diarize:
-        required: false
-        type: boolean
-        default: false
-      max_speakers:
-        required: false
-        type: string
-        default: "0"
-      capture_wait_seconds:
-        required: false
-        type: string
-        default: "180"
-    secrets:
-      FIRST:
-        required: true
-      LAST:
-        required: true
-      COMPANY:
-        required: true
-      EMAIL:
-        required: true
-      HF_TOKEN:
-        required: false
-      # Yahoo SMTP secrets (SSL 465)
-      YAHOO_EMAIL:
-        required: false
-      YAHOO_APP_PASSWORD:
-        required: false
-      TO_EMAIL:
-        required: false
+        default: ""
 
 jobs:
-  run:
+  call:
     runs-on: ubuntu-latest
+    env:
+      OUT_DIR: out
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install tools (Playwright, ffmpeg, Streamlink, Whisper)
+      # ---- Playwright capture (gets the real .m3u8 + cookies/headers) ----
+      - name: Install Playwright + deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg jq streamlink
           python -m pip install --upgrade pip
-          python -m pip install playwright openai-whisper
+          pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Create inline Playwright capture helper (HLS/DASH + headers + screenshot)
-        run: |
-          cat > /tmp/hls_capture_inline.py <<'PY'
-          import os, json, asyncio, re, time, pathlib
-          from urllib.parse import urlparse
-          from playwright.async_api import async_playwright
-
-          URL=os.environ["EVENT_URL"]
-          FIRST=os.environ["FIRST"]; LAST=os.environ["LAST"]
-          COMPANY=os.environ["COMPANY"]; EMAIL=os.environ["EMAIL"]
-          WAIT=int(os.environ.get("CAPTURE_WAIT","180"))
-
-          LABELS={"First Name":FIRST,"Last Name":LAST,"Company":COMPANY,"Email":EMAIL}
-          MANIFEST_RE=re.compile(r"\.(m3u8|mpd)(\?.*)?$", re.IGNORECASE)
-
-          def header_key(dct, name):
-              for k in dct.keys():
-                  if k.lower()==name.lower(): return k
-              return None
-
-          async def try_click_play(frame):
-              selectors = [
-                  ".vjs-big-play-button",
-                  "button[aria-label='Play']",
-                  "button:has-text('Play')",
-                  "div[role='button']:has-text('Play')",
-                  "button.ytp-large-play-button",
-              ]
-              for sel in selectors:
-                  try:
-                      el = frame.locator(sel)
-                      if await el.count() > 0:
-                          await el.first.click(timeout=1000)
-                          return True
-                  except: pass
-              try:
-                  await frame.evaluate("""() => {
-                    const v = document.querySelector('video');
-                    if (v) { v.muted = true; v.play().catch(()=>{}); }
-                  }""")
-              except: pass
-              return False
-
-          async def main():
-              pathlib.Path("recordings").mkdir(parents=True, exist_ok=True)
-              async with async_playwright() as p:
-                  b=await p.chromium.launch(headless=True)
-                  ctx=await b.new_context()
-                  pg=await ctx.new_page()
-                  found={"url":None,"headers":{}, "from":"", "when":None}
-
-                  def take_from_request(req, frame_url):
-                      u=req.url
-                      if MANIFEST_RE.search(u) and not found["url"]:
-                          found["url"]=u; found["from"]=frame_url; found["when"]=time.time()
-                          hdr=req.headers or {}
-                          for key in ["authorization","x-auth-token","x-amz-security-token","user-agent"]:
-                              real=header_key(hdr,key)
-                              if real: found["headers"][real]=hdr[real]
-                          found["headers"]["Referer"]=pg.url
-                          pr=urlparse(pg.url); found["headers"]["Origin"]=f"{pr.scheme}://{pr.netloc}"
-
-                  pg.on("request", lambda r: take_from_request(r, pg.url))
-                  pg.on("response", lambda r: take_from_request(r.request, pg.url))
-
-                  await pg.goto(URL, wait_until="domcontentloaded")
-
-                  for lab,val in LABELS.items():
-                      try: await pg.get_by_label(lab, exact=True).fill(val)
-                      except: pass
-
-                  async def tf(sel,val):
-                      try: await pg.fill(sel,val); return True
-                      except: return False
-                  await tf("input[name='firstName']",FIRST); await tf("input[name='firstname']",FIRST); await tf("input[placeholder='First Name']",FIRST)
-                  await tf("input[name='lastName']",LAST);  await tf("input[name='lastname']",LAST);  await tf("input[placeholder='Last Name']",LAST)
-                  await tf("input[name='company']",COMPANY); await tf("input[placeholder='Company']",COMPANY)
-                  await tf("input[name='email']",EMAIL);   await tf("input[type='email']",EMAIL)
-
-                  for sel in ["button[type='submit']","input[type='submit']","button:has-text('Enter')","button:has-text('Register')","button:has-text('Log In')","button:has-text('Watch')"]:
-                      try: await pg.click(sel, timeout=1000); break
-                      except: pass
-
-                  for fr in pg.frames:
-                      fr.on("request", lambda r, f=fr: take_from_request(r, f.url))
-                      fr.on("response", lambda r, f=fr: take_from_request(r.request, f.url))
-                  pg.on("frameattached", lambda fr: (fr.on("request", lambda r, f=fr: take_from_request(r, f.url)),
-                                                     fr.on("response", lambda r, f=fr: take_from_request(r.request, f.url))))
-
-                  try:
-                      await pg.wait_for_load_state("networkidle", timeout=120000)
-                  except: pass
-
-                  for fr in pg.frames:
-                      try: await try_click_play(fr)
-                      except: pass
-
-                  t0=time.time()
-                  while not found["url"] and (time.time()-t0)<WAIT:
-                      await asyncio.sleep(1)
-
-                  try:
-                      await pg.screenshot(path="recordings/page_after_capture.jpg", full_page=True)
-                  except: pass
-                  try:
-                      html = await pg.content()
-                      open("recordings/page_after_capture.html","w",encoding="utf-8").write(html)
-                  except: pass
-
-                  ck=await ctx.cookies()
-                  cookie="; ".join(f"{c['name']}={c['value']}" for c in ck) if ck else ""
-                  with open("session_info.json","w") as f:
-                      json.dump({"manifest_url":found["url"],"headers":found["headers"],"cookies":cookie,"source_frame":found["from"],"captured_at":found["when"]}, f)
-                  print("Captured:", json.dumps({"has_manifest": bool(found["url"])}))
-                  await b.close()
-
-          if __name__=="__main__":
-              asyncio.run(main())
-          PY
-
-      - name: Login & capture manifest (HLS .m3u8 or DASH .mpd)
+      - name: Capture HLS manifest with Playwright
         env:
-          EVENT_URL: ${{ inputs.url }}
-          FIRST:     ${{ secrets.FIRST }}
-          LAST:      ${{ secrets.LAST }}
-          COMPANY:   ${{ secrets.COMPANY }}
-          EMAIL:     ${{ secrets.EMAIL }}
-          CAPTURE_WAIT: ${{ inputs.capture_wait_seconds }}
+          PAGE_URL: ${{ github.event.inputs.page_url }}
+          OUT_DIR: ${{ env.OUT_DIR }}
         run: |
-          if echo "$EVENT_URL" | grep -Eiq '\.(m3u8|mpd)(\?.*)?$'; then
-            echo "Direct manifest detected; skipping Playwright."
-            printf '%s\n' \
-              '{' \
-              "  \"manifest_url\": \"${EVENT_URL}\"," \
-              '  "headers": {},' \
-              '  "cookies": ""' \
-              '}' > session_info.json
+          mkdir -p "${OUT_DIR}"
+          python scripts/capture_manifest.py
+          echo "Captured files in ${OUT_DIR}:"
+          ls -la "${OUT_DIR}"
+
+      # ---- Recording tools ----
+      - name: Install ffmpeg, streamlink, jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg streamlink jq
+          ffmpeg -version
+          streamlink --version
+
+      # ---- Verify outputs from capture step ----
+      - name: Verify exported artifacts exist
+        env:
+          M3U8: ${{ env.OUT_DIR }}/manifest.m3u8
+          MTXT: ${{ env.OUT_DIR }}/manifest.txt
+          COOK: ${{ env.OUT_DIR }}/cookies.json
+        run: |
+          set -euo pipefail
+          test -s "$COOK" || { echo "❌ Missing cookies JSON: $COOK"; exit 3; }
+          if [ ! -s "$M3U8" ] && [ ! -s "$MTXT" ]; then
+            echo "❌ No manifest found at $M3U8 or $MTXT"
+            exit 2
+          fi
+          echo "✅ Found cookies + (m3u8 or text manifest)"
+
+      - name: Extract HLS URL
+        id: hls
+        env:
+          M3U8: ${{ env.OUT_DIR }}/manifest.m3u8
+          MTXT: ${{ env.OUT_DIR }}/manifest.txt
+        run: |
+          set -euo pipefail
+          if [ -s "$M3U8" ]; then
+            URL="$(sed -n '1p' "$M3U8")"
           else
-            echo "Using Playwright to capture manifest..."
-            python /tmp/hls_capture_inline.py
+            URL="$(grep -Eo 'https?://[^ ]+\.m3u8[^ ]*' "$MTXT" | head -n1)"
           fi
-          echo "== session_info.json =="
-          cat session_info.json || true
-          mkdir -p recordings
-          cp -f session_info.json recordings/session_info.json || true
-          echo "== Artifacts in recordings/ (if present) =="
-          ls -l recordings || true
+          [ -n "${URL:-}" ] || { echo "❌ Could not extract .m3u8 URL"; exit 4; }
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "HLS URL: $URL"
 
-      - name: Record audio (ffmpeg, Streamlink fallback)
-        id: rec
+      - name: Build auth for streamlink/ffmpeg
+        id: auth
         env:
-          MINUTES: ${{ inputs.minutes }}
-          PROBE:   ${{ inputs.probe_seconds }}
+          COOK: ${{ env.OUT_DIR }}/cookies.json
+          HDRS: ${{ env.OUT_DIR }}/headers.json
         run: |
-          URL=$(jq -r '.manifest_url' session_info.json)
-          CK=$(jq -r '.cookies // empty' session_info.json)
-          REF=$(jq -r '.headers.Referer // empty' session_info.json)
-          ORG=$(jq -r '.headers.Origin // empty' session_info.json)
+          set -euo pipefail
+          # Streamlink cookies: one --http-cookie per cookie
+          SL_COOKIES="$(jq -r '.[] | "--http-cookie \(.name)=\(.value)"' "$COOK" | xargs || true)"
+          echo "sl_cookies=${SL_COOKIES}" >> "$GITHUB_OUTPUT"
 
-          if [ -n "$PROBE" ] && [ "$PROBE" != "0" ]; then DURATION=$PROBE; else DURATION=$((MINUTES*60)); fi
+          # Build a single headers file for ffmpeg
+          HDR_FILE=headers.txt
+          COOKIE_HDR="$(jq -r '.[] | "\(.name)=\(.value)"' "$COOK" | paste -sd'; ' -)"
+          echo "Cookie: ${COOKIE_HDR}" > "$HDR_FILE"
 
-          TS=$(date -u +"%Y%m%d-%H%M%S")
-          OUT="recordings/event-${TS}.m4a"
-          mkdir -p recordings
+          if [ -s "$HDRS" ]; then
+            jq -r '.[] | "\(.name): \(.value)"' "$HDRS" >> "$HDR_FILE"
+          fi
 
-          HDRS=""
-          [ -n "$CK" ]  && HDRS="${HDRS}Cookie: ${CK}\r\n"
-          [ -n "$REF" ] && HDRS="${HDRS}Referer: ${REF}\r\n"
-          [ -n "$ORG" ] && HDRS="${HDRS}Origin: ${ORG}\r\n"
-          jq -r '.headers | to_entries[] | "\(.key): \(.value)\r\n"' session_info.json > /tmp/extra_hdrs.txt || true
-          [ -s /tmp/extra_hdrs.txt ] && HDRS="${HDRS}$(cat /tmp/extra_hdrs.txt)"
+          echo "hdr_file=${HDR_FILE}" >> "$GITHUB_OUTPUT"
+          echo "Wrote headers to ${HDR_FILE}:"
+          cat "$HDR_FILE"
 
-          if [ -n "$URL" ] && [ "$URL" != "null" ]; then
-            echo "Recording via ffmpeg…"
-            ffmpeg -hide_banner -loglevel error \
-              -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 \
-              -rw_timeout 15000000 -user_agent "Mozilla/5.0" \
-              -headers "$HDRS" -i "$URL" -t $DURATION \
-              -vn -c:a aac -b:a 128k "$OUT" || {
-                echo "ffmpeg failed; trying Streamlink…"
-                streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$URL" best -O | \
-                  ffmpeg -hide_banner -loglevel error -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT" || exit 1
-              }
+      - name: Record audio (Streamlink → ffmpeg fallback; verbose)
+        env:
+          URL: ${{ steps.hls.outputs.url }}
+          SL_COOKIES: ${{ steps.auth.outputs.sl_cookies }}
+          HDR_FILE: ${{ steps.auth.outputs.hdr_file }}
+          DURATION: ${{ github.event.inputs.duration_sec }}
+        run: |
+          set -euo pipefail
+
+          retry() {
+            n=0
+            until [ "$n" -ge 2 ]; do
+              "$@" && return 0
+              n=$((n+1))
+              echo "Retry $n/2 after failure..."
+              sleep 3
+            done
+            return 1
+          }
+
+          # If you pass a duration, use it for both tools
+          DUR_ARG=""
+          if [ -n "${DURATION:-}" ]; then
+            DUR_ARG_FFMPEG="-t ${DURATION}"
+          fi
+
+          echo "=== STREAMLINK (debug) ==="
+          if ! retry bash -lc 'streamlink -l debug ${SL_COOKIES} --hls-live-restart "$URL" best -o stream.ts'; then
+            echo "Streamlink failed; switching to ffmpeg…"
+            echo "=== FFMPEG (verbose) ==="
+            HDRS="$(tr "\n" "\r\n" < "$HDR_FILE")"
+            retry bash -lc 'ffmpeg -nostdin -loglevel verbose -headers "$HDRS" -i "$URL" '"${DUR_ARG_FFMPEG:-}"' -vn -acodec copy audio.m4a'
           else
-            echo "No manifest captured; trying Streamlink on page URL…"
-            PAGE_URL="${{ inputs.url }}"
-            streamlink --http-header "Cookie=$CK" --http-header "Referer=$REF" --http-header "Origin=$ORG" "$PAGE_URL" best -O | \
-              ffmpeg -hide_banner -loglevel error -i - -t $DURATION -vn -c:a aac -b:a 128k "$OUT" || exit 1
+            echo "Converting TS → M4A (audio only)"
+            ffmpeg -nostdin -loglevel verbose -i stream.ts -vn -acodec copy audio.m4a
           fi
 
-          echo "out_file=$OUT" >> $GITHUB_OUTPUT
-          ls -l recordings || true
+          test -s audio.m4a || { echo "❌ audio.m4a not created"; exit 5; }
+          echo "✅ Recorded audio.m4a"
 
-      - name: Transcribe with Whisper (CLI)
-        run: |
-          set -e
-          FILE=$(ls -1 recordings/event-*.m4a | tail -n 1 || true)
-          if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
-            echo "No recording found"; exit 1
-          fi
-          whisper "$FILE" --model "${{ inputs.model }}" \
-            --task transcribe \
-            --output_format all \
-            --output_dir recordings \
-            --verbose False
-
-      - name: (Optional) Install diarization deps
-        if: ${{ inputs.diarize == true }}
-        run: |
-          python -m pip install --upgrade pip
-          pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
-          pip install pyannote.audio==3.* numpy==1.*
-
-      - name: (Optional) Diarize and write simple speaker file
-        if: ${{ inputs.diarize == true }}
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          MAX_SPK:  ${{ inputs.max_speakers }}
-        run: |
-          python <<'PY'
-          import os
-          from pathlib import Path
-          from pyannote.audio import Pipeline
-
-          out_dir = Path("recordings")
-          audio = sorted(out_dir.glob("event-*.m4a"))[-1]
-          token = os.environ["HF_TOKEN"]
-          n = os.environ.get("MAX_SPK","0")
-          num_speakers = int(n) if n.isdigit() and int(n) > 0 else None
-
-          pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
-          diarization = pipeline(str(audio), num_speakers=num_speakers)
-
-          with open(out_dir / "event-diarized.txt","w") as f:
-              for turn,_,speaker in diarization.itertracks(yield_label=True):
-                  f.write(f"{speaker} [{turn.start:.1f}-{turn.end:.1f}]\n")
-          PY
-
-      - name: Upload artifacts
+      - name: Upload audio artifact
         uses: actions/upload-artifact@v4
         with:
-          name: audio-and-transcripts
-          path: recordings/*
-          retention-days: 14
+          name: audio
+          path: audio.m4a
+          if-no-files-found: error
 
-      - name: Email results (Yahoo SSL 465)
-        if: ${{ always() }}
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.mail.yahoo.com
-          server_port: 465
-          secure: true
-          username: ${{ secrets.YAHOO_EMAIL }}
-          password: ${{ secrets.YAHOO_APP_PASSWORD }}
-          from:     ${{ secrets.YAHOO_EMAIL }}
-          to:       ${{ secrets.TO_EMAIL }}
-          subject: "🎧 [${{ github.workflow }}] — ${{ job.status }} (run #${{ github.run_number }})"
-          body: |
-            Workflow: ${{ github.workflow }}
-            Status:   ${{ job.status }}
-            Repo:     ${{ github.repository }}
-            Event URL: ${{ inputs.url }}
-            Duration:  ${{ inputs.probe_seconds != '0' && format('{0}s (probe)', inputs.probe_seconds) || format('{0} min', inputs.minutes) }}
-            Run:      https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-            Attachments include the transcript and capture debug artifacts (if present).
-          attachments: |
-            recordings/page_after_capture.jpg
-            recordings/page_after_capture.html
-            recordings/session_info.json
-            recordings/event-diarized.txt
-            recordings/*.txt
+      # ---- OPTIONAL: Transcribe with Whisper CLI (uncomment if desired) ----
+      # - name: Install whisper
+      #   run: |
+      #     pip install openai-whisper
+      #     sudo apt-get install -y ffmpeg
+      #
+      # - name: Transcribe
+      #   run: |
+      #     mkdir -p out
+      #     whisper audio.m4a --language en --model small --output_dir out
+      #
+      # - name: Upload transcript
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: transcript
+      #     path: out/*
