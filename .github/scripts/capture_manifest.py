@@ -1,159 +1,75 @@
 #!/usr/bin/env python3
-# capture_manifest.py
-# Usage:
-#   python .github/scripts/capture_manifest.py --url "https://example.com" --out out
-#
-# What it does:
-# - Opens the URL with Playwright (headless)
-# - Listens for network requests/responses that look like HLS manifests (.m3u8)
-# - Writes out/session_info.json with {"manifest_url": "...", "page_url": "...", "found_by": "..."}
-# - Also writes out/manifests.txt with all candidates it saw
-
-import argparse
-import json
-import os
-import sys
-import time
+import argparse, json, os, re, sys, time
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlsplit
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+from playwright.sync_api import sync_playwright
 
-HLS_EXTENSIONS = (".m3u8",)
-HLS_CONTENT_TYPES = {
-    "application/vnd.apple.mpegurl",
-    "application/x-mpegurl",
-    "audio/mpegurl",
-}
-
-def looks_like_hls_url(url: str) -> bool:
-    u = url.lower()
-    if any(ext in u for ext in HLS_EXTENSIONS):
-        return True
-    # Some players serve manifests behind query params without .m3u8 in path
-    # Try a loose match for "m3u8" anywhere
-    if "m3u8" in u:
-        return True
-    return False
-
-def choose_best_candidate(candidates):
-    """Pick a likely master manifest first (contains 'master' or 'index'), else last seen."""
-    if not candidates:
-        return None
-    # Prefer master-ish
-    for url in candidates:
-        u = url.lower()
-        if "master" in u or "index" in u:
-            return url
-    # otherwise return the last one we saw
-    return candidates[-1]
+PATTERN = re.compile(r"\.(m3u8|mpd)(\?.*)?$", re.IGNORECASE)
 
 def main():
-    parser = argparse.ArgumentParser(description="Capture HLS manifest URL from a webpage.")
-    parser.add_argument("--url", dest="page_url", required=True, help="Page URL to open")
-    parser.add_argument("--out", dest="out_dir", default="out", help="Output directory")
-    parser.add_argument("--wait", dest="wait_seconds", type=int, default=25,
-                        help="Seconds to wait while the page loads and streams start")
-    parser.add_argument("--click-selector", dest="click_selector", default=None,
-                        help="Optional CSS selector to click Play/Start if needed")
-    parser.add_argument("--user-agent", dest="user_agent", default=None,
-                        help="Optional custom user agent")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", required=True, help="Web page that plays the stream")
+    ap.add_argument("--out", required=True, help="Output directory")
+    ap.add_argument("--wait", type=float, default=12.0, help="Extra seconds to idle on page")
+    ap.add_argument("--timeout", type=int, default=45000, help="Page goto timeout ms")
+    ap.add_argument("--debug", action="store_true", help="Dump request log")
+    args = ap.parse_args()
 
-    out_path = Path(args.out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
 
-    candidates = []
+    found = []           # list of {"url": "...", "type": "hls|dash"}
+    request_log = []     # optional for debug
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context_kwargs = {}
-        if args.user_agent:
-            context_kwargs["user_agent"] = args.user_agent
-        context = browser.new_context(**context_kwargs)
-        page = context.new_page()
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context()
+        page = ctx.new_page()
 
-        # Collect from requests
-        def on_request(request):
-            url = request.url
-            if looks_like_hls_url(url):
-                candidates.append(url)
+        def maybe_record(req):
+            url = req.url
+            if args.debug:
+                request_log.append({"method": req.method, "url": url})
+            m = PATTERN.search(url)
+            if m:
+                kind = "hls" if m.group(1).lower() == "m3u8" else "dash"
+                # Avoid duplicates (ignore querystring differences)
+                key = urlsplit(url)._replace(query="").geturl()
+                if not any(urlsplit(x["url"])._replace(query="").geturl() == key for x in found):
+                    found.append({"url": url, "type": kind})
 
-        # Collect from responses by content-type
-        def on_response(response):
-            try:
-                ct = response.headers.get("content-type", "")
-            except Exception:
-                ct = ""
-            if any(mime in ct.lower() for mime in HLS_CONTENT_TYPES):
-                candidates.append(response.url)
+        page.on("request", maybe_record)
 
-        page.on("request", on_request)
-        page.on("response", on_response)
-
+        page.goto(args.url, wait_until="domcontentloaded", timeout=args.timeout)
+        # Some players lazy-load after user gesture; try a gentle click
         try:
-            page.goto(args.page_url, wait_until="load", timeout=45000)
-        except PWTimeoutError:
-            # Still proceed; some pages keep loading assets for a long time
-            pass
-
-        # If a click is needed to start playback
-        if args.click_selector:
-            try:
-                page.wait_for_selector(args.click_selector, timeout=8000)
-                page.click(args.click_selector)
-            except PWTimeoutError:
-                # Not fatal; continue to wait for network traffic
-                pass
-            except Exception:
-                pass
-
-        # Also probe for <video><source src="...m3u8"></video>
-        try:
-            srcs = page.eval_on_selector_all(
-                "video source, video",
-                "els => els.map(e => e.src || e.currentSrc || e.getAttribute('src') || '')"
-            )
-            for s in srcs:
-                if s and looks_like_hls_url(s):
-                    candidates.append(s)
+            page.mouse.click(200, 200)
         except Exception:
             pass
 
-        # Let the page run and network settle
-        t0 = time.time()
-        while time.time() - t0 < args.wait_seconds:
-            time.sleep(0.5)
+        time.sleep(args.wait)
 
-        context.close()
-        browser.close()
+        if args.debug:
+            (out / "network_requests.json").write_text(json.dumps(request_log, indent=2))
 
-    # Deduplicate but preserve order
-    seen = set()
-    uniq = []
-    for u in candidates:
-        if u and u not in seen:
-            seen.add(u)
-            uniq.append(u)
+        if not found:
+            print("No HLS or DASH manifest found", file=sys.stderr)
+            # 2 = nothing matched (kept for your workflow logic)
+            sys.exit(2)
 
-    # Persist all candidates for debugging
-    (out_path / "manifests.txt").write_text("\n".join(uniq), encoding="utf-8")
+        # Save a concise summary and the first URL for downstream steps
+        (out / "manifests.json").write_text(json.dumps(found, indent=2))
+        (out / "first_manifest_url.txt").write_text(found[0]["url"] + "\n")
 
-    best = choose_best_candidate(uniq)
-    session_info = {
-        "page_url": args.page_url,
-        "manifest_url": best or "",
-        "found_by": "request/response sniffing" if best else "",
-        "all_candidates_count": len(uniq),
-    }
-    (out_path / "session_info.json").write_text(json.dumps(session_info, indent=2), encoding="utf-8")
+        # Also write one file per manifest with a friendly name
+        for i, item in enumerate(found, 1):
+            suffix = ".m3u8" if item["type"] == "hls" else ".mpd"
+            (out / f"manifest_{i:02d}_{item['type']}{suffix}.url").write_text(item["url"] + "\n")
 
-    if best:
-        print(best)
-        sys.exit(0)
-    else:
-        print("No HLS manifest found", file=sys.stderr)
-        sys.exit(2)
+        print(f"Captured {len(found)} manifest URL(s).")
+        for item in found:
+            print(f" - [{item['type'].upper()}] {item['url']}")
 
 if __name__ == "__main__":
     main()
