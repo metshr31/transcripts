@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       page_url:
-        description: "Public webcast/player PAGE URL (not the .m3u8)"
+        description: "Webcast/player PAGE URL (not the .m3u8)"
         required: true
       duration_sec:
-        description: "Optional hard stop in seconds (leave blank to let stream end naturally)"
+        description: "Optional hard stop in seconds (e.g., 900 = 15m)"
         required: false
         default: ""
 
 jobs:
-  call:
+  record:
     runs-on: ubuntu-latest
     env:
       OUT_DIR: out
@@ -26,24 +26,32 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ---- Playwright capture (gets the real .m3u8 + cookies/headers) ----
-      - name: Install Playwright + deps
+      # --- Capture the real .m3u8 URL + cookies/headers via Playwright ---
+      - name: Install Playwright + Chromium
         run: |
           python -m pip install --upgrade pip
           pip install playwright
           python -m playwright install --with-deps chromium
 
+      - name: Verify capture script exists
+        run: |
+          test -f scripts/capture_manifest.py || { echo "scripts/capture_manifest.py not found"; exit 2; }
+
       - name: Capture HLS manifest with Playwright
         env:
           PAGE_URL: ${{ github.event.inputs.page_url }}
           OUT_DIR: ${{ env.OUT_DIR }}
+          # optional login; add repo secrets if needed
+          LOGIN_USER: ${{ secrets.WEBCAST_USER }}
+          LOGIN_PASS: ${{ secrets.WEBCAST_PASS }}
         run: |
+          set -euo pipefail
           mkdir -p "${OUT_DIR}"
           python scripts/capture_manifest.py
           echo "Captured files in ${OUT_DIR}:"
           ls -la "${OUT_DIR}"
 
-      # ---- Recording tools ----
+      # --- Install recording tools ---
       - name: Install ffmpeg, streamlink, jq
         run: |
           sudo apt-get update
@@ -51,8 +59,8 @@ jobs:
           ffmpeg -version
           streamlink --version
 
-      # ---- Verify outputs from capture step ----
-      - name: Verify exported artifacts exist
+      # --- Verify capture outputs ---
+      - name: Verify exported artifacts
         env:
           M3U8: ${{ env.OUT_DIR }}/manifest.m3u8
           MTXT: ${{ env.OUT_DIR }}/manifest.txt
@@ -89,21 +97,16 @@ jobs:
           HDRS: ${{ env.OUT_DIR }}/headers.json
         run: |
           set -euo pipefail
-          # Streamlink cookies: one --http-cookie per cookie
           SL_COOKIES="$(jq -r '.[] | "--http-cookie \(.name)=\(.value)"' "$COOK" | xargs || true)"
           echo "sl_cookies=${SL_COOKIES}" >> "$GITHUB_OUTPUT"
-
-          # Build a single headers file for ffmpeg
           HDR_FILE=headers.txt
           COOKIE_HDR="$(jq -r '.[] | "\(.name)=\(.value)"' "$COOK" | paste -sd'; ' -)"
           echo "Cookie: ${COOKIE_HDR}" > "$HDR_FILE"
-
           if [ -s "$HDRS" ]; then
             jq -r '.[] | "\(.name): \(.value)"' "$HDRS" >> "$HDR_FILE"
           fi
-
           echo "hdr_file=${HDR_FILE}" >> "$GITHUB_OUTPUT"
-          echo "Wrote headers to ${HDR_FILE}:"
+          echo "Headers:"
           cat "$HDR_FILE"
 
       - name: Record audio (Streamlink → ffmpeg fallback; verbose)
@@ -114,58 +117,35 @@ jobs:
           DURATION: ${{ github.event.inputs.duration_sec }}
         run: |
           set -euo pipefail
-
           retry() {
             n=0
             until [ "$n" -ge 2 ]; do
               "$@" && return 0
               n=$((n+1))
-              echo "Retry $n/2 after failure..."
+              echo "Retry $n/2..."
               sleep 3
             done
             return 1
           }
-
-          # If you pass a duration, use it for both tools
-          DUR_ARG=""
+          DUR_ARG_FFMPEG=""
           if [ -n "${DURATION:-}" ]; then
             DUR_ARG_FFMPEG="-t ${DURATION}"
           fi
-
           echo "=== STREAMLINK (debug) ==="
           if ! retry bash -lc 'streamlink -l debug ${SL_COOKIES} --hls-live-restart "$URL" best -o stream.ts'; then
-            echo "Streamlink failed; switching to ffmpeg…"
-            echo "=== FFMPEG (verbose) ==="
+            echo "Streamlink failed; trying ffmpeg…"
             HDRS="$(tr "\n" "\r\n" < "$HDR_FILE")"
             retry bash -lc 'ffmpeg -nostdin -loglevel verbose -headers "$HDRS" -i "$URL" '"${DUR_ARG_FFMPEG:-}"' -vn -acodec copy audio.m4a'
           else
-            echo "Converting TS → M4A (audio only)"
             ffmpeg -nostdin -loglevel verbose -i stream.ts -vn -acodec copy audio.m4a
           fi
-
           test -s audio.m4a || { echo "❌ audio.m4a not created"; exit 5; }
           echo "✅ Recorded audio.m4a"
 
       - name: Upload audio artifact
         uses: actions/upload-artifact@v4
         with:
-          name: audio
+          name: audio-${{ github.run_id }}
           path: audio.m4a
           if-no-files-found: error
-
-      # ---- OPTIONAL: Transcribe with Whisper CLI (uncomment if desired) ----
-      # - name: Install whisper
-      #   run: |
-      #     pip install openai-whisper
-      #     sudo apt-get install -y ffmpeg
-      #
-      # - name: Transcribe
-      #   run: |
-      #     mkdir -p out
-      #     whisper audio.m4a --language en --model small --output_dir out
-      #
-      # - name: Upload transcript
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: transcript
-      #     path: out/*
+          retention-days: 7
