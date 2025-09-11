@@ -1,30 +1,40 @@
-name: Playwright Tests (Headless)
+name: Playwright CI (Headless)
 
 on:
   push:
+    branches: [ main ]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      PLAYWRIGHT_HEADLESS: "1"
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
           cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Install Playwright browsers with OS deps
+      - name: Install Playwright browsers + deps
         run: npx playwright install --with-deps
 
-      - name: Run Playwright tests (headless)
-        env:
-          CI: true
-        run: npx playwright test
+      - name: Run Playwright tests (Chromium headless)
+        run: npx playwright test --project=chromium
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report
+          if-no-files-found: ignore
