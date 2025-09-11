@@ -1,217 +1,189 @@
 #!/usr/bin/env python3
-import argparse, asyncio, json, os, re, sys, time
+# capture_manifest.py
+#
+# Usage example:
+#   python scripts/capture_manifest.py \
+#     --url "https://event.webcasts.com/starthere.jsp?ei=1732689&tp_key=88708506b9&tp_special=8" \
+#     --out "out" \
+#     --wait-ms 60000 \
+#     --auto-play
+#
+# Notes:
+# - Requires Playwright Python:  pip install playwright
+# - One-time:  playwright install --with-deps
+#
+# Exit codes:
+#   0 = success
+#   2 = no manifest detected
+#   3 = other error
+
+import argparse
+import json
+import re
+import sys
+import time
 from pathlib import Path
-from typing import List, Dict, Optional
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-M3U8_PAT = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
-M3U8_CT  = ("application/vnd.apple.mpegurl", "application/x-mpegURL", "audio/mpegurl")
+M3U8_RE = re.compile(r"\.m3u8(\?|$)", re.IGNORECASE)
+MPD_RE  = re.compile(r"\.mpd(\?|$)", re.IGNORECASE)
 
 COMMON_PLAY_SELECTORS = [
     "button[aria-label='Play']",
+    ".vjs-big-play-button",
     "button[title='Play']",
-    "button:has-text('Play')",
     "button.play",
-    ".vjs-play-control",
-    ".jw-controlbar .jw-icon-playback",
-    ".ytp-play-button",
-    "[data-control='play']",
-    "video",                # fallback: focus video and press Space/Enter
+    "[data-testid='play-button']",
+    "video",  # as last resort, try a click on the <video>
 ]
 
-IFRAME_QUERY = "iframe, frame"
+def parse_args():
+    p = argparse.ArgumentParser(description="Capture HLS/DASH manifest URL via Playwright.")
+    p.add_argument("--url", dest="url", required=True, help="Page URL with the embedded player.")
+    p.add_argument("--out", dest="out_dir", default="out", help="Output directory (default: out)")
+    p.add_argument("--wait-ms", dest="wait_ms", type=int, default=45000,
+                   help="Max time to wait for manifest (ms). Default 45000.")
+    p.add_argument("--auto-play", action="store_true",
+                   help="Attempt to click a Play button automatically.")
+    p.add_argument("--play-selector", action="append", default=[],
+                   help="Additional CSS selector(s) to click to start playback. Can be repeated.")
+    p.add_argument("--eval-js", default=None,
+                   help="Optional JS to eval after load (e.g., to unmute or trigger play).")
+    p.add_argument("--headless", action="store_true", help="Run browser headless.")
+    p.add_argument("--device-scale", type=float, default=1.0, help="Device scale factor.")
+    p.add_argument("--viewport-w", type=int, default=1280)
+    p.add_argument("--viewport-h", type=int, default=720)
+    return p.parse_args()
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+def save_json(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-def ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-def write_json(path: Path, data: Dict) -> None:
-    path.write_text(json.dumps(data, indent=2))
-
-def looks_like_m3u8(url: str, content_type: Optional[str]) -> bool:
-    if M3U8_PAT.search(url):
-        return True
-    if content_type:
-        ct = content_type.split(";")[0].strip()
-        if ct in M3U8_CT:
-            return True
-    return False
-
-async def click_play_in_frame(frame, extra_wait_ms: int, debug: bool) -> bool:
-    # Try a bunch of likely selectors; on success, wait a bit for network.
-    for sel in COMMON_PLAY_SELECTORS:
+def try_click_play(page, extra_selectors):
+    tried = []
+    for sel in extra_selectors + COMMON_PLAY_SELECTORS:
         try:
-            el = await frame.query_selector(sel)
+            el = page.query_selector(sel)
             if el:
-                if debug: print(f"[debug] Clicking '{sel}'")
-                try:
-                    await el.click(timeout=2000)
-                except Exception:
-                    # Some players need a user-gesture on the video element
-                    try: await el.focus()
-                    except Exception: pass
-                    try: await frame.keyboard.press("Space")
-                    except Exception: pass
-                await frame.wait_for_timeout(extra_wait_ms)
-                return True
-        except Exception:
-            continue
-    # Final resort: click center of the frame
-    try:
-        if debug: print("[debug] Clicking center of frame as fallback")
-        box = await frame.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
-        await frame.mouse.click(box["w"]/2, box["h"]/2)
-        await frame.wait_for_timeout(extra_wait_ms)
-        return True
-    except Exception:
-        return False
-
-async def collect_manifests(page, wait_ms: int, click_after_ms: int, debug: bool) -> List[Dict]:
-    found: List[Dict] = []
-
-    def maybe_add(kind: str, url: str, ct: Optional[str]):
-        if not url:
-            return
-        if looks_like_m3u8(url, ct):
-            # Dedup by URL
-            if not any(x["url"] == url for x in found):
-                if debug: print(f"[debug] Found {kind} m3u8: {url} (ct={ct})")
-                found.append({"url": url, "content_type": ct or "", "source": kind})
-
-    # Hook requests + responses
-    page.on("request", lambda req: maybe_add("request", req.url, None))
-    page.on("response", lambda resp: maybe_add("response", resp.url, resp.headers.get("content-type", "")))
-
-    # Wait for initial network after load
-    start = now_ms()
-    await page.wait_for_load_state("domcontentloaded")
-    try:
-        await page.wait_for_load_state("networkidle")
-    except PWTimeout:
-        pass
-
-    # Allow some idle time for auto-starting players
-    await page.wait_for_timeout(min(wait_ms, 8000))
-
-    # If nothing yet, try to click Play on page & iframes
-    if not found:
-        if debug: print("[debug] No m3u8 yet; attempting to trigger playback...")
-        # Try top-level first
-        triggered = await click_play_in_frame(page, click_after_ms, debug)
-
-        # Then scan frames
-        for frame in page.frames:
-            try:
-                if frame is page.main_frame: 
-                    continue
-                if debug: print(f"[debug] Attempting click inside iframe: {frame.url}")
-                trig2 = await click_play_in_frame(frame, click_after_ms, debug)
-                triggered = triggered or trig2
-            except Exception:
-                continue
-
-        # Give network more time post-clicks
-        await page.wait_for_timeout(max(1500, click_after_ms))
-
-    # Final grace period to catch late requests
-    remaining = max(0, wait_ms - (now_ms() - start))
-    if remaining:
-        if debug: print(f"[debug] Final wait {remaining}ms")
-        await page.wait_for_timeout(remaining)
-
-    return found
-
-async def run(opts):
-    out_dir = Path(opts.out).resolve()
-    ensure_dir(out_dir)
-
-    storage_state_path = out_dir / "storage_state.json"
-    session_info_path  = out_dir / "session_info.json"
-    har_path           = out_dir / "session.har" if opts.har else None
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=not opts.headed, args=[
-            "--autoplay-policy=no-user-gesture-required",
-        ])
-        context_kwargs = {
-            "ignore_https_errors": True,
-            "user_agent": opts.user_agent or None,
-            "viewport": {"width": 1400, "height": 850},
-            "java_script_enabled": True,
-            "accept_downloads": False,
-        }
-        if har_path:
-            context_kwargs["record_har_path"] = str(har_path)
-            context_kwargs["record_har_omit_content"] = True
-
-        context = await browser.new_context(**context_kwargs)
-        page = await context.new_page()
-
-        # Navigate
-        if opts.debug: print(f"[debug] Navigating to {opts.url}")
-        try:
-            await page.goto(opts.url, wait_until="domcontentloaded", timeout=opts.timeout)
-        except PWTimeout:
-            print("ERROR: Page load timed out.", file=sys.stderr)
-            await browser.close()
-            sys.exit(1)
-
-        # Optional: accept consent banners that block playback
-        try:
-            # Common CMP accept buttons (best-effort)
-            for sel in ["button:has-text('Accept')", "button:has-text('I Agree')", "#onetrust-accept-btn-handler"]:
-                el = await page.query_selector(sel)
-                if el:
-                    if opts.debug: print(f"[debug] Clicking consent '{sel}'")
-                    await el.click(timeout=1000)
-                    await page.wait_for_timeout(500)
+                el.click(force=True, timeout=1000)
+                tried.append(sel)
+                # give the page a moment to react
+                time.sleep(0.5)
         except Exception:
             pass
+    return tried
 
-        manifests = await collect_manifests(
-            page,
-            wait_ms=opts.wait,
-            click_after_ms=opts.after_click_wait,
-            debug=opts.debug,
+def main():
+    args = parse_args()
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    captured_urls = []
+    manifest_url = None
+    manifest_kind = None  # "hls" or "dash"
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=args.headless)
+        context = browser.new_context(
+            viewport={"width": args.viewport_w, "height": args.viewport_h},
+            device_scale_factor=args.device_scale,
+            ignore_https_errors=True,
         )
+        page = context.new_page()
 
-        await context.storage_state(path=str(storage_state_path))
-        await browser.close()
+        # Listen on ALL responses (main page + iframes) and collect candidate URLs
+        def on_response(resp):
+            try:
+                url = resp.url
+                if M3U8_RE.search(url):
+                    captured_urls.append(("hls", url))
+                elif MPD_RE.search(url):
+                    captured_urls.append(("dash", url))
+            except Exception:
+                pass
 
-    if not manifests:
-        print("ERROR: No HLS .m3u8 manifest detected. Check auth gates, playback triggers, or increase WAIT_MS.", file=sys.stderr)
-        sys.exit(1)
+        page.on("response", on_response)
 
-    # Prefer the first found; also emit all candidates.
-    primary = manifests[0]["url"]
-    out = {
-        "page_url": opts.url,
-        "manifest_url": primary,
-        "all_manifests": manifests,
-        "har_path": str(har_path) if har_path else "",
-        "storage_state": str(storage_state_path),
-        "ts": int(time.time()),
-    }
-    write_json(session_info_path, out)
-    print(f"Captured manifest: {primary}")
-    print(f"Wrote: {session_info_path}")
+        # Go to the page and wait for network to settle a bit
+        page.goto(args.url, wait_until="domcontentloaded", timeout=60000)
 
-def parse_args():
-    ap = argparse.ArgumentParser(description="Capture HLS .m3u8 manifest URL with Playwright")
-    ap.add_argument("--url", required=True, help="Web page URL with embedded player")
-    ap.add_argument("--out", required=True, help="Output directory")
-    ap.add_argument("--wait", type=int, default=15000, help="Total max wait (ms) for manifests (default 15000)")
-    ap.add_argument("--after-click-wait", type=int, default=4000, help="Extra wait (ms) after triggering Play (default 4000)")
-    ap.add_argument("--timeout", type=int, default=45000, help="Navigation timeout (ms)")
-    ap.add_argument("--headed", action="store_true", help="Run headed (for local debugging)")
-    ap.add_argument("--debug", action="store_true", help="Verbose debug logs")
-    ap.add_argument("--har", action="store_true", help="Record a HAR file to inspect network later")
-    ap.add_argument("--user-agent", default="", help="Override User-Agent if needed")
-    return ap.parse_args()
+        # Optional eval
+        if args.eval_js:
+            try:
+                page.evaluate(args.eval_js)
+                time.sleep(0.2)
+            except Exception:
+                # Non-fatal
+                pass
+
+        # Optional auto-play: try common selectors + any provided
+        tried_selectors = []
+        if args.auto_play:
+            try:
+                tried_selectors = try_click_play(page, args.play_selector)
+            except Exception:
+                pass
+
+        # As an extra nudge, try to press Space (many players map this to play/pause)
+        if args.auto_play:
+            try:
+                page.keyboard.press("Space")
+            except Exception:
+                pass
+
+        # Actively wait up to wait_ms for the first manifest URL to appear
+        deadline = time.time() + (args.wait_ms / 1000.0)
+        while time.time() < deadline and manifest_url is None:
+            # Check anything we have captured so far
+            for kind, url in captured_urls:
+                if M3U8_RE.search(url):
+                    manifest_url, manifest_kind = url, "hls"
+                    break
+            if manifest_url is None:
+                for kind, url in captured_urls:
+                    if MPD_RE.search(url):
+                        manifest_url, manifest_kind = url, "dash"
+                        break
+            if manifest_url:
+                break
+            time.sleep(0.25)
+
+        # Prepare session info for downstream steps
+        session = {
+            "page_url": args.url,
+            "manifest_url": manifest_url,
+            "manifest_type": manifest_kind,
+            "clicked_selectors": tried_selectors,
+            "saw_candidates_count": len(captured_urls),
+            "candidates_sample": [u for _, u in captured_urls[:10]],
+            "timestamp": int(time.time()),
+        }
+
+        save_json(out_dir / "session_info.json", session)
+
+        if manifest_url:
+            # Optionally, save a copy of the manifest file itself
+            # (some players require headers; this simple GET may not always work —
+            # but saving the URL itself is usually sufficient for downstream tooling)
+            print(manifest_url)  # keep stdout clean for GitHub Actions steps
+            browser.close()
+            sys.exit(0)
+
+        # No manifest found
+        print("ERROR: No HLS .m3u8 or DASH .mpd manifest detected.", file=sys.stderr)
+        print(json.dumps(session, indent=2), file=sys.stderr)
+        browser.close()
+        sys.exit(2)
+
 
 if __name__ == "__main__":
-    opts = parse_args()
-    asyncio.run(run(opts))
+    try:
+        main()
+    except PWTimeoutError as e:
+        print(f"ERROR: Playwright timeout — {e}", file=sys.stderr)
+        sys.exit(3)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(3)
