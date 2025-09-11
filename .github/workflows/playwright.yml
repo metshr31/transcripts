@@ -1,0 +1,30 @@
+name: Playwright Tests (Headless)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers with OS deps
+        run: npx playwright install --with-deps
+
+      - name: Run Playwright tests (headless)
+        env:
+          CI: true
+        run: npx playwright test
