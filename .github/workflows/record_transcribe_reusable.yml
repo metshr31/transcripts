@@ -1,151 +1,53 @@
-name: Record & Transcribe (HLS)
+name: Record & Transcribe (HLS) / call
 
 on:
   workflow_dispatch:
-    inputs:
-      page_url:
-        description: "Webcast/player PAGE URL (not the .m3u8)"
-        required: true
-      duration_sec:
-        description: "Optional hard stop in seconds (e.g., 900 = 15m)"
-        required: false
-        default: ""
 
 jobs:
-  record:
+  capture-manifest:
     runs-on: ubuntu-latest
-    env:
-      OUT_DIR: out
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      # --- Capture the real .m3u8 URL + cookies/headers via Playwright ---
-      - name: Install Playwright + Chromium
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install playwright
-          python -m playwright install --with-deps chromium
+          playwright install chromium
 
-      - name: Verify capture script exists
-        run: |
-          test -f scripts/capture_manifest.py || { echo "scripts/capture_manifest.py not found"; exit 2; }
-
-      - name: Capture HLS manifest with Playwright
+      - name: Capture manifest with Playwright
+        working-directory: .github
         env:
-          PAGE_URL: ${{ github.event.inputs.page_url }}
-          OUT_DIR: ${{ env.OUT_DIR }}
-          # optional login; add repo secrets if needed
-          LOGIN_USER: ${{ secrets.WEBCAST_USER }}
-          LOGIN_PASS: ${{ secrets.WEBCAST_PASS }}
+          OUT_DIR: out
+          PAGE_URL: https://event.webcasts.com/starthere.jsp?ei=1732689&tp_key=88708506b9&tp_special=8
         run: |
           set -euo pipefail
-          mkdir -p "${OUT_DIR}"
-          python scripts/capture_manifest.py
-          echo "Captured files in ${OUT_DIR}:"
-          ls -la "${OUT_DIR}"
+          mkdir -p "$OUT_DIR"
+          python scripts/capture_manifest.py --url "$PAGE_URL" --out "$OUT_DIR"
+          echo "Captured files in $OUT_DIR:"
+          ls -la "$OUT_DIR"
 
-      # --- Install recording tools ---
-      - name: Install ffmpeg, streamlink, jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg streamlink jq
-          ffmpeg -version
-          streamlink --version
-
-      # --- Verify capture outputs ---
-      - name: Verify exported artifacts
-        env:
-          M3U8: ${{ env.OUT_DIR }}/manifest.m3u8
-          MTXT: ${{ env.OUT_DIR }}/manifest.txt
-          COOK: ${{ env.OUT_DIR }}/cookies.json
-        run: |
-          set -euo pipefail
-          test -s "$COOK" || { echo "❌ Missing cookies JSON: $COOK"; exit 3; }
-          if [ ! -s "$M3U8" ] && [ ! -s "$MTXT" ]; then
-            echo "❌ No manifest found at $M3U8 or $MTXT"
-            exit 2
-          fi
-          echo "✅ Found cookies + (m3u8 or text manifest)"
-
-      - name: Extract HLS URL
-        id: hls
-        env:
-          M3U8: ${{ env.OUT_DIR }}/manifest.m3u8
-          MTXT: ${{ env.OUT_DIR }}/manifest.txt
-        run: |
-          set -euo pipefail
-          if [ -s "$M3U8" ]; then
-            URL="$(sed -n '1p' "$M3U8")"
-          else
-            URL="$(grep -Eo 'https?://[^ ]+\.m3u8[^ ]*' "$MTXT" | head -n1)"
-          fi
-          [ -n "${URL:-}" ] || { echo "❌ Could not extract .m3u8 URL"; exit 4; }
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "HLS URL: $URL"
-
-      - name: Build auth for streamlink/ffmpeg
-        id: auth
-        env:
-          COOK: ${{ env.OUT_DIR }}/cookies.json
-          HDRS: ${{ env.OUT_DIR }}/headers.json
-        run: |
-          set -euo pipefail
-          SL_COOKIES="$(jq -r '.[] | "--http-cookie \(.name)=\(.value)"' "$COOK" | xargs || true)"
-          echo "sl_cookies=${SL_COOKIES}" >> "$GITHUB_OUTPUT"
-          HDR_FILE=headers.txt
-          COOKIE_HDR="$(jq -r '.[] | "\(.name)=\(.value)"' "$COOK" | paste -sd'; ' -)"
-          echo "Cookie: ${COOKIE_HDR}" > "$HDR_FILE"
-          if [ -s "$HDRS" ]; then
-            jq -r '.[] | "\(.name): \(.value)"' "$HDRS" >> "$HDR_FILE"
-          fi
-          echo "hdr_file=${HDR_FILE}" >> "$GITHUB_OUTPUT"
-          echo "Headers:"
-          cat "$HDR_FILE"
-
-      - name: Record audio (Streamlink → ffmpeg fallback; verbose)
-        env:
-          URL: ${{ steps.hls.outputs.url }}
-          SL_COOKIES: ${{ steps.auth.outputs.sl_cookies }}
-          HDR_FILE: ${{ steps.auth.outputs.hdr_file }}
-          DURATION: ${{ github.event.inputs.duration_sec }}
-        run: |
-          set -euo pipefail
-          retry() {
-            n=0
-            until [ "$n" -ge 2 ]; do
-              "$@" && return 0
-              n=$((n+1))
-              echo "Retry $n/2..."
-              sleep 3
-            done
-            return 1
-          }
-          DUR_ARG_FFMPEG=""
-          if [ -n "${DURATION:-}" ]; then
-            DUR_ARG_FFMPEG="-t ${DURATION}"
-          fi
-          echo "=== STREAMLINK (debug) ==="
-          if ! retry bash -lc 'streamlink -l debug ${SL_COOKIES} --hls-live-restart "$URL" best -o stream.ts'; then
-            echo "Streamlink failed; trying ffmpeg…"
-            HDRS="$(tr "\n" "\r\n" < "$HDR_FILE")"
-            retry bash -lc 'ffmpeg -nostdin -loglevel verbose -headers "$HDRS" -i "$URL" '"${DUR_ARG_FFMPEG:-}"' -vn -acodec copy audio.m4a'
-          else
-            ffmpeg -nostdin -loglevel verbose -i stream.ts -vn -acodec copy audio.m4a
-          fi
-          test -s audio.m4a || { echo "❌ audio.m4a not created"; exit 5; }
-          echo "✅ Recorded audio.m4a"
-
-      - name: Upload audio artifact
-        uses: actions/upload-artifact@v4
+      - name: Email results via Yahoo
+        uses: dawidd6/action-send-mail@v3
         with:
-          name: audio-${{ github.run_id }}
-          path: audio.m4a
-          if-no-files-found: error
-          retention-days: 7
+          server_address: smtp.mail.yahoo.com
+          server_port: 465          # SSL
+          secure: true
+          username: ${{ secrets.YAHOO_EMAIL }}
+          password: ${{ secrets.YAHOO_APP_PASSWORD }}
+          from: ${{ secrets.YAHOO_EMAIL }}
+          to: ${{ secrets.TO_EMAIL }}
+          subject: "HLS Manifest Capture — ${{ github.repository }} — run #${{ github.run_number }}"
+          body: |
+            Captured files are attached.
+            Repo: ${{ github.repository }}
+            Run ID: ${{ github.run_id }}
+            Commit: ${{ github.sha }}
+          attachments: .github/out/*
