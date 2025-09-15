@@ -26,14 +26,35 @@ concurrency:
   group: press-release-tracker
   cancel-in-progress: false
 
-jobs:
-  press_release_tracker:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+name: Press Release Tracker
 
-      - name: Set up Python
+on:
+  workflow_dispatch: {}
+  # add a schedule if you want it to run automatically
+  # schedule:
+  #   - cron: "0 12 * * 1-5"  # 12:00 UTC on weekdays
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      # static defaults; adjust as needed
+      OUTPUT_DIR: outputs
+      MAIL_FROM_NAME: Press Release Tracker
+      LOOKBACK_HOURS: "24"
+      SEND_ALWAYS: "true"
+      # secrets (keep these names consistent with your repo settings)
+      YAHOO_EMAIL: ${{ secrets.YAHOO_EMAIL }}
+      YAHOO_APP_PASSWORD: ${{ secrets.YAHOO_APP_PASSWORD }}
+      TO_EMAIL: ${{ secrets.TO_EMAIL }}
+
+    steps:
+      - name: Checkout
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -43,22 +64,21 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # Optional but handy once: confirms paths at the repo root
-      - name: Debug layout
+      - name: Verify script exists
         run: |
-          pwd
-          ls -la
-          ls -la scripts || true
+          echo "PWD: $(pwd)"
+          ls -la .github || true
+          test -f .github/press_release_tracker.py || (echo "ERROR: .github/press_release_tracker.py not found"; exit 1)
 
-      - name: Run tracker (from repo root)
-        env:
-          OUTPUT_DIR: outputs
-          MAIL_FROM_NAME: Press Release Tracker
-          LOOKBACK_HOURS: "24"
-          SEND_ALWAYS: "true"
-          YAHOO_EMAIL: ${{ secrets.YAHOO_EMAIL }}
-          YAHOO_APP_PASSWORD: ${{ secrets.YAHOO_APP_PASSWORD }}
-          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+      - name: Run press release tracker
         run: |
-          mkdir -p outputs
-          python scripts/press_release_tracker.py
+          mkdir -p "$OUTPUT_DIR"
+          python .github/press_release_tracker.py
+
+      - name: Upload outputs (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: press-release-tracker
+          path: outputs/**
+          if-no-files-found: ignore
+          retention-days: 14
