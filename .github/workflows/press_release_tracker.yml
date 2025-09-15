@@ -14,7 +14,7 @@ on:
         required: true
         default: "true"
         type: string
-  # Scheduled runs (Mon–Fri): 08:15 & 16:20 ET (EDT=UTC-4)
+  # Scheduled runs (Mon–Fri): 08:15 & 16:20 ET (EDT = UTC-4)
   schedule:
     - cron: "15 12 * * 1-5"   # 08:15 ET
     - cron: "20 20 * * 1-5"   # 16:20 ET
@@ -26,47 +26,38 @@ concurrency:
   group: press-release-tracker
   cancel-in-progress: false
 
-name: Press Release Tracker
-
-on:
-  workflow_dispatch: {}
-  # add a schedule if you want it to run automatically
-  # schedule:
-  #   - cron: "0 12 * * 1-5"  # 12:00 UTC on weekdays
-
 jobs:
   run:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+
     env:
-      # static defaults; adjust as needed
       OUTPUT_DIR: outputs
       MAIL_FROM_NAME: Press Release Tracker
-      LOOKBACK_HOURS: "24"
-      SEND_ALWAYS: "true"
-      # secrets (keep these names consistent with your repo settings)
-      YAHOO_EMAIL: ${{ secrets.YAHOO_EMAIL }}
+      # Use inputs for manual runs; fall back to defaults for schedules
+      LOOKBACK_HOURS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_hours || '24' }}
+      SEND_ALWAYS:   ${{ github.event_name == 'workflow_dispatch' && inputs.send_always   || 'true' }}
+      # Secrets
+      YAHOO_EMAIL:        ${{ secrets.YAHOO_EMAIL }}
       YAHOO_APP_PASSWORD: ${{ secrets.YAHOO_APP_PASSWORD }}
-      TO_EMAIL: ${{ secrets.TO_EMAIL }}
+      TO_EMAIL:           ${{ secrets.TO_EMAIL }}
 
     steps:
       - name: Checkout
-      - uses: actions/checkout@v4
+        uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install dependencies (if any)
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Verify script exists
         run: |
-          echo "PWD: $(pwd)"
+          echo "Repo root: $(pwd)"
           ls -la .github || true
           test -f .github/press_release_tracker.py || (echo "ERROR: .github/press_release_tracker.py not found"; exit 1)
 
