@@ -1,6 +1,7 @@
 name: Press Release Tracker (Yahoo Email)
 
 on:
+  # Manual trigger with inputs
   workflow_dispatch:
     inputs:
       lookback_hours:
@@ -13,7 +14,8 @@ on:
         required: true
         default: "true"
         type: string
-  # Mon–Fri: 08:15 & 16:20 ET (EDT = UTC-4)
+
+  # Weekdays at 08:15 & 16:20 ET (EDT=UTC-4)
   schedule:
     - cron: "15 12 * * 1-5"
     - cron: "20 20 * * 1-5"
@@ -32,8 +34,12 @@ jobs:
     env:
       OUTPUT_DIR: outputs
       MAIL_FROM_NAME: Press Release Tracker
+      # Use manual inputs when present; fallback for scheduled runs
       LOOKBACK_HOURS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_hours || '24' }}
       SEND_ALWAYS:   ${{ github.event_name == 'workflow_dispatch' && inputs.send_always   || 'true' }}
+      OUTPUT_FORMATS: "xlsx,pdf"  # any of: xlsx,csv,pdf,docx,json
+
+      # Secrets (set these in your repo settings)
       YAHOO_EMAIL:        ${{ secrets.YAHOO_EMAIL }}
       YAHOO_APP_PASSWORD: ${{ secrets.YAHOO_APP_PASSWORD }}
       TO_EMAIL:           ${{ secrets.TO_EMAIL }}
@@ -46,19 +52,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          # no cache: pip here because there is no requirements/pyproject file
+          # no pip cache here because you don't keep a requirements file in repo
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip wheel setuptools
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          elif [ -f .github/requirements.txt ]; then
-            pip install -r .github/requirements.txt
-          else
-            # minimal deps used by the tracker
-            pip install "feedparser>=6.0.11" "requests>=2.31" "beautifulsoup4>=4.12" "lxml>=5.0" "python-dateutil>=2.9" "pytz>=2024.1"
-          fi
+          # Core libs for the tracker + file exports
+          pip install "feedparser>=6.0.11" "requests>=2.31" "beautifulsoup4>=4.12" "lxml>=5.0" \
+                      "python-dateutil>=2.9" "pytz>=2024.1" "pandas>=2.2" "openpyxl>=3.1" \
+                      "python-docx>=1.1" "reportlab>=4.2"
 
       - name: Verify script exists
         run: |
