@@ -13,9 +13,10 @@ on:
         required: true
         default: "true"
         type: string
+  # Mon–Fri: 08:15 & 16:20 ET (EDT = UTC-4)
   schedule:
-    - cron: "15 12 * * 1-5"   # 08:15 ET
-    - cron: "20 20 * * 1-5"   # 16:20 ET
+    - cron: "15 12 * * 1-5"
+    - cron: "20 20 * * 1-5"
 
 permissions:
   contents: write
@@ -27,6 +28,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     env:
       OUTPUT_DIR: outputs
       MAIL_FROM_NAME: Press Release Tracker
@@ -40,28 +42,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          # no cache: pip here because there is no requirements/pyproject file
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip wheel setuptools
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           elif [ -f .github/requirements.txt ]; then
             pip install -r .github/requirements.txt
           else
             # minimal deps used by the tracker
-            pip install feedparser requests beautifulsoup4 lxml python-dateutil pytz
+            pip install "feedparser>=6.0.11" "requests>=2.31" "beautifulsoup4>=4.12" "lxml>=5.0" "python-dateutil>=2.9" "pytz>=2024.1"
           fi
 
       - name: Verify script exists
         run: |
-          echo "Repo root: $(pwd)"
-          ls -la .github || true
           test -f .github/press_release_tracker.py || (echo "ERROR: .github/press_release_tracker.py not found"; exit 1)
 
       - name: Run press release tracker
