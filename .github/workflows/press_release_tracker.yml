@@ -1,12 +1,23 @@
 name: Press Release Tracker (Yahoo Email)
 
 on:
+  # Manual trigger with inputs
+  workflow_dispatch:
+    inputs:
+      lookback_hours:
+        description: "Lookback window (hours)"
+        required: true
+        default: "24"
+        type: string
+      send_always:
+        description: "Email even if 0 items? (true/false)"
+        required: true
+        default: "true"
+        type: string
+  # Scheduled runs (Mon–Fri): 08:15 & 16:20 ET (EDT=UTC-4)
   schedule:
-    # 08:15 AM ET (EDT=UTC-4) -> 12:15 UTC, Mon–Fri
-    - cron: "15 12 * * 1-5"
-    # 04:20 PM ET (EDT=UTC-4) -> 20:20 UTC, Mon–Fri
-    - cron: "20 20 * * 1-5"
-  workflow_dispatch: {}
+    - cron: "15 12 * * 1-5"   # 08:15 ET
+    - cron: "20 20 * * 1-5"   # 16:20 ET
 
 permissions:
   contents: write
@@ -20,12 +31,14 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONUNBUFFERED: "1"
-      LOOKBACK_HOURS: "24"
       OUTPUT_DIR: "outputs"
-      SEND_ALWAYS: "true"
       MAIL_FROM_NAME: "Press Release Tracker"
 
-      # === Yahoo email (matches your secrets naming) ===
+      # From manual inputs (with defaults above)
+      LOOKBACK_HOURS: ${{ inputs.lookback_hours }}
+      SEND_ALWAYS:    ${{ inputs.send_always }}
+
+      # === Yahoo email secrets (exact names you use) ===
       YAHOO_EMAIL:        ${{ secrets.YAHOO_EMAIL }}
       YAHOO_APP_PASSWORD: ${{ secrets.YAHOO_APP_PASSWORD }}
       TO_EMAIL:           ${{ secrets.TO_EMAIL }}
@@ -45,8 +58,7 @@ jobs:
           pip install feedparser python-dateutil
 
       - name: Run tracker (collect + email)
-        run: |
-          python scripts/press_release_tracker.py
+        run: python scripts/press_release_tracker.py
 
       - name: Commit outputs (if changed)
         run: |
