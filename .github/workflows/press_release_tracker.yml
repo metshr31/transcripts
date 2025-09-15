@@ -1,0 +1,61 @@
+name: Press Release Tracker (Yahoo Email)
+
+on:
+  schedule:
+    # 08:15 AM ET (EDT=UTC-4) -> 12:15 UTC, Mon–Fri
+    - cron: "15 12 * * 1-5"
+    # 04:20 PM ET (EDT=UTC-4) -> 20:20 UTC, Mon–Fri
+    - cron: "20 20 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: press-release-tracker
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+      LOOKBACK_HOURS: "24"
+      OUTPUT_DIR: "outputs"
+      SEND_ALWAYS: "true"
+      MAIL_FROM_NAME: "Press Release Tracker"
+
+      # === Yahoo email (matches your secrets naming) ===
+      YAHOO_EMAIL:        ${{ secrets.YAHOO_EMAIL }}
+      YAHOO_APP_PASSWORD: ${{ secrets.YAHOO_APP_PASSWORD }}
+      TO_EMAIL:           ${{ secrets.TO_EMAIL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install feedparser python-dateutil
+
+      - name: Run tracker (collect + email)
+        run: |
+          python scripts/press_release_tracker.py
+
+      - name: Commit outputs (if changed)
+        run: |
+          if [[ -n "$(git status --porcelain outputs)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add outputs
+            git commit -m "Press Release Tracker: $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
+            git push
+          else
+            echo "No changes to commit."
+          fi
