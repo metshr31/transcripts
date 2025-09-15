@@ -1,7 +1,6 @@
 name: Press Release Tracker (Yahoo Email)
 
 on:
-  # Manual trigger with inputs
   workflow_dispatch:
     inputs:
       lookback_hours:
@@ -14,7 +13,6 @@ on:
         required: true
         default: "true"
         type: string
-  # Scheduled runs (Mon–Fri): 08:15 & 16:20 ET (EDT = UTC-4)
   schedule:
     - cron: "15 12 * * 1-5"   # 08:15 ET
     - cron: "20 20 * * 1-5"   # 16:20 ET
@@ -29,14 +27,11 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     env:
       OUTPUT_DIR: outputs
       MAIL_FROM_NAME: Press Release Tracker
-      # Use inputs for manual runs; fall back to defaults for schedules
       LOOKBACK_HOURS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_hours || '24' }}
       SEND_ALWAYS:   ${{ github.event_name == 'workflow_dispatch' && inputs.send_always   || 'true' }}
-      # Secrets
       YAHOO_EMAIL:        ${{ secrets.YAHOO_EMAIL }}
       YAHOO_APP_PASSWORD: ${{ secrets.YAHOO_APP_PASSWORD }}
       TO_EMAIL:           ${{ secrets.TO_EMAIL }}
@@ -49,11 +44,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Install dependencies (if any)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f .github/requirements.txt ]; then
+            pip install -r .github/requirements.txt
+          else
+            # minimal deps used by the tracker
+            pip install feedparser requests beautifulsoup4 lxml python-dateutil pytz
+          fi
 
       - name: Verify script exists
         run: |
