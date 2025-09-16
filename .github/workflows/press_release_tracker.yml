@@ -6,7 +6,7 @@ on:
       lookback_hours:
         description: "Lookback window (hours)"
         required: true
-        default: "24"
+        default: "12"
         type: string
       send_always:
         description: "Email even if 0 items? (true/false)"
@@ -15,7 +15,9 @@ on:
         type: string
   schedule:
     - cron: "15 12 * * 1-5"   # 08:15 ET (GitHub cron is UTC)
+    - cron: "5 13 * * 1-5"    # 09:05 ET
     - cron: "20 20 * * 1-5"   # 16:20 ET
+    - cron: "45 20 * * 1-5"   # 16:45 ET
 
 jobs:
   run:
@@ -48,11 +50,18 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas>=2.2.2 openpyxl>=3.1.5 reportlab>=4.2.2 feedparser>=6.0.11 requests>=2.32.3
+          pip install pandas>=2.2.2 openpyxl>=3.1.5 reportlab>=4.2.2 feedparser>=6.0.11 requests>=2.32.3 beautifulsoup4>=4.12.3
+
+      - name: Preflight secrets
+        run: |
+          die(){ echo "::error::$1"; exit 1; }
+          [ -n "${{ secrets.YAHOO_EMAIL }}" ]          || die "YAHOO_EMAIL is missing"
+          [ -n "${{ secrets.YAHOO_APP_PASSWORD }}" ]   || die "YAHOO_APP_PASSWORD is missing"
+          [ -n "${{ secrets.TO_EMAIL }}" ]             || die "TO_EMAIL is missing"
 
       - name: Run press release tracker
         run: |
-          python press_releases_tracker.py --lookback_hours "${LOOKBACK_HOURS}" --send_always "${SEND_ALWAYS}"
+          python .github/press_release_tracker.py --lookback_hours "${LOOKBACK_HOURS}" --send_always "${SEND_ALWAYS}"
 
       - name: Commit reports
         run: |
