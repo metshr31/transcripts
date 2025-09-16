@@ -2,26 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-One Big Beautiful PY — Press Release Collector → Filter → Report → Email
+Press Release Collector → Filter → Report → Email
 
-- Collects from RSS feeds, with HTML scraping fallback for newsroom pages.
+- Collects from RSS feeds (with HTML scraping fallback for newsroom pages).
 - Strict, low-noise filters for trucking/LTL/intermodal/rail/brokers.
-- Removes noisy abbreviations ("TL", "LTL", "Class I").
-- Hard-blocks ad/portal links; excludes class-action/awareness/festival junk.
+- Avoids junk like TL/LTL abbreviations, lawsuits, awareness months, festivals.
 - Exports CSV, XLSX, JSON, PDF into reports/press_releases_YYYYMMDD_HHMM.*.
-- Emails attachments via Yahoo SMTP.
+- Emails results via Yahoo SMTP.
 
-Environment (set in GitHub Actions secrets):
-  LOOKBACK_HOURS     (default "24")
-  SEND_ALWAYS        ("true"/"false", default "true")
-  COLLECT            ("1" = collect feeds [default]; "0" = read INPUT_PATH)
-  INPUT_PATH         (default "outputs/press_releases_raw.csv")
-  SOURCE_URLS        (comma-separated URLs; RSS preferred but HTML supported)
-  STRICT_POSITIVE    ("1" default = company OR sector; "2" = require BOTH)
-  YAHOO_EMAIL        (sender Yahoo address)
-  YAHOO_APP_PASSWORD (Yahoo app password)
-  TO_EMAIL           (comma-separated recipients)
-  YAHOO_CC           (optional CC list, comma-separated)
+Environment variables (set in GitHub Actions secrets):
+  LOOKBACK_HOURS, SEND_ALWAYS, COLLECT, INPUT_PATH, SOURCE_URLS, STRICT_POSITIVE
+  YAHOO_EMAIL, YAHOO_APP_PASSWORD, TO_EMAIL, YAHOO_CC
 """
 
 import os, re, ssl, smtplib, argparse
@@ -37,16 +28,14 @@ from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 
-# ---------------- Default feeds ----------------
+# ---------------- Feeds ----------------
 DEFAULT_FEEDS = [
-    # RSS
     "https://www.globenewswire.com/RssFeed/industry/Transportation.xml",
     "https://www.businesswire.com/portal/site/home/news/rss/industry/?vnsId=31367",
     "https://www.businesswire.com/portal/site/home/news/rss/industry/?vnsId=1050097",
     "https://www.businesswire.com/portal/site/home/news/rss/industry/?vnsId=1000155",
     "https://www.businesswire.com/portal/site/home/news/rss/industry/?vnsId=1000188",
-
-    # HTML newsroom pages (fallback)
+    # HTML fallback pages
     "https://www.businesswire.com/newsroom?industry=1050097",
     "https://www.businesswire.com/newsroom?industry=1000155",
     "https://www.businesswire.com/newsroom?industry=1000188",
@@ -83,18 +72,17 @@ SECTOR_KEYWORDS = [
 ]
 SECTOR_KEYWORDS.extend(WATCHLIST_COMPANIES)
 
+# ---------------- Domain filters ----------------
 SOURCE_DOMAIN_ALLOWLIST = {
     "www.globenewswire.com", "www.businesswire.com", "www.prnewswire.com",
     "newsroom.jbhunt.com", "media.unionpacific.com", "www.bnsf.com",
     "investors.csx.com", "media.nscorp.com", "www.cn.ca", "www.cpkcr.com",
     "investors.schneider.com", "investors.hubgroup.com", "investors.chrobinson.com",
 }
-
 EXCLUSION_DOMAINS = {
     "api.taboola.com", "ad.doubleclick.net",
     "mail.yahoo.com", "r.mail.yahoo.com", "news.mail.yahoo.com",
 }
-
 EXCLUSION_PHRASES = [
     "class action", "securities litigation", "shareholder alert", "investigation -",
     "rosen law firm", "pomerantz", "glancy prongay", "monteverde & associates",
@@ -131,13 +119,12 @@ def fetch_feed_content(url: str, timeout: int = 15) -> bytes | None:
     headers = {"User-Agent": "Mozilla/5.0 (PressReleaseBot/1.0)"}
     try:
         r = s.get(url, headers=headers, timeout=timeout)
-        if r.ok and r.content:
-            return r.content
+        if r.ok and r.content: return r.content
     except requests.RequestException as e:
         print(f"[WARN] HTTP error for {url}: {e}")
     return None
 
-def scrape_newsroom_page(url: str, lookback_hours: int) -> list[dict]:
+def scrape_newsroom_page(url: str) -> list[dict]:
     rows = []
     try:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
@@ -161,7 +148,7 @@ def scrape_newsroom_page(url: str, lookback_hours: int) -> list[dict]:
     return rows
 
 # ---------------- Collect ----------------
-def collect_from_feeds(feed_urls: list[str], lookback_hours: int) -> pd.DataFrame:
+def collect_from_feeds(feed_urls: list[str]) -> pd.DataFrame:
     rows = []
     for url in feed_urls:
         try:
@@ -188,7 +175,7 @@ def collect_from_feeds(feed_urls: list[str], lookback_hours: int) -> pd.DataFram
                     continue
             # fallback
             print(f"[INFO] Scraping fallback for {url}")
-            rows.extend(scrape_newsroom_page(url, lookback_hours))
+            rows.extend(scrape_newsroom_page(url))
         except Exception as ex:
             print(f"[WARN] Collection error {url}: {ex}")
     return pd.DataFrame(rows)
@@ -202,19 +189,19 @@ def apply_filters(df_raw: pd.DataFrame, strict_mode: int = 1) -> pd.DataFrame:
     for c in ["title", "summary", "companies_matched", "source", "url"]:
         if c in df.columns: df[c] = df[c].astype(str).fillna("").map(_norm)
 
-    # filter by domain
+    # domain filters
     if "url" in df.columns:
         df["_domain"] = df["url"].map(_domain_from_url)
         df = df[~df["_domain"].isin(EXCLUSION_DOMAINS)]
         if SOURCE_DOMAIN_ALLOWLIST:
             df = df[df["_domain"].isin(SOURCE_DOMAIN_ALLOWLIST)]
 
-    # filter by exclusion phrases
+    # exclude phrases
     excl_mask = df.apply(lambda r: _contains_any(
         (r.get("title","") + " " + r.get("summary","")), EXCLUSION_PHRASES), axis=1)
     df = df[~excl_mask]
 
-    # positive filter
+    # positive match
     def row_positive(r) -> bool:
         text = f"{r.get('title','')} {r.get('summary','')} {r.get('companies_matched','')}"
         has_company = bool(RE_WATCHLIST.search(text))
@@ -234,7 +221,7 @@ def write_pdf(df: pd.DataFrame, path: str, title: str):
     c.setFont("Helvetica-Bold", 14); c.drawString(margin, y, title); y -= 0.3 * inch
     c.setFont("Helvetica", 9)
     if df.empty:
-        c.drawString(margin, y, "No qualifying press releases in the selected window."); c.save(); return
+        c.drawString(margin, y, "No qualifying press releases."); c.save(); return
 
     def draw_line(text: str):
         nonlocal y
@@ -298,7 +285,7 @@ def main():
     feed_urls = [u.strip() for u in env_urls.split(",") if u.strip()] if env_urls else DEFAULT_FEEDS
 
     if collect:
-        df_raw = collect_from_feeds(feed_urls, lookback_hours)
+        df_raw = collect_from_feeds(feed_urls)
     else:
         if not os.path.exists(input_path): df_raw = pd.DataFrame()
         else: df_raw = pd.read_json(input_path) if input_path.lower().endswith(".json") else pd.read_csv(input_path)
@@ -335,4 +322,21 @@ def main():
           <table style="width:100%;border-collapse:collapse;font-family:Arial,sans-serif;font-size:14px;">
             {rows_html}
           </table>
-          <p style="color:#666;font-size:12px;">Auto-generated at {datetime.now(timezone.utc).strftime("%Y-%m-%
+          <p style="color:#666;font-size:12px;">Auto-generated at {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}</p>
+        </body></html>"""
+
+        attachments = []
+        for path, mime in [(out_csv,"text/csv"),
+                           (out_xlsx,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                           (out_json,"application/json"),
+                           (out_pdf,"application/pdf")]:
+            with open(path, "rb") as f:
+                attachments.append((os.path.basename(path), f.read(), mime))
+
+        send_email(subject, html_body, attachments)
+        print(f"[OK] Emailed report with {total} items.")
+    else:
+        print("[OK] No items and SEND_ALWAYS=false — no email sent.")
+
+if __name__ == "__main__":
+    main()
