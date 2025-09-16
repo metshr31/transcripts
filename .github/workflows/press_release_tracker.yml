@@ -36,12 +36,6 @@ jobs:
       LOOKBACK_HOURS: ${{ github.event.inputs.lookback_hours || '24' }}
       SEND_ALWAYS: ${{ github.event.inputs.send_always || 'true' }}
 
-      # Yahoo secrets (must exist in repo Settings > Secrets and variables > Actions)
-      MAIL-FROM:          ${{ secrets.MAIL_FROM }}
-      YAHOO_APP_PASSWORD: ${{ secrets.YAHOO_APP_PASSWORD }}
-      MAIL_TO:            ${{ secrets.MAIL_TO }}
-      YAHOO_CC:           ${{ secrets.YAHOO_CC }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,13 +49,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pandas>=2.2.2 openpyxl>=3.1.5 reportlab>=4.2.2 feedparser>=6.0.11 requests>=2.32.3
-
-      - name: Preflight secrets
-        run: |
-          die(){ echo "::error::$1"; exit 1; }
-          [ -n "${MAIL_FROM}" ]        || die "MAIL FROM is missing"
-          [ -n "${YAHOO_APP_PASSWORD}" ] || die "YAHOO_APP_PASSWORD is missing"
-          [ -n "${MAIL_TO}" ]           || die "MAIL_TO is missing"
 
       - name: Run press release tracker
         run: |
@@ -81,3 +68,22 @@ jobs:
           name: press_release_reports
           path: reports/*.*
           if-no-files-found: ignore
+
+      - name: Email results via Yahoo
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.mail.yahoo.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.YAHOO_EMAIL }}
+          password: ${{ secrets.YAHOO_APP_PASSWORD }}
+          from: ${{ secrets.YAHOO_EMAIL }}
+          to: ${{ secrets.TO_EMAIL }}
+          cc: ${{ secrets.YAHOO_CC }}
+          subject: "Press Release Report — ${{ github.repository }} — run #${{ github.run_number }}"
+          body: |
+            Press release tracker run completed.
+            Repo: ${{ github.repository }}
+            Run ID: ${{ github.run_id }}
+            Commit: ${{ github.sha }}
+          attachments: reports/*.*
