@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     env:
       PYTHONUNBUFFERED: "1"
       INPUT_PATH: "outputs/press_releases_raw.csv"
@@ -31,6 +32,12 @@ jobs:
       STRICT_POSITIVE: "1"
       LOOKBACK_HOURS: ${{ github.event.inputs.lookback_hours || '24' }}
       SEND_ALWAYS: ${{ github.event.inputs.send_always || 'true' }}
+
+      # ✅ Yahoo secrets mapped into environment
+      YAHOO_EMAIL: ${{ secrets.YAHOO_EMAIL }}
+      YAHOO_APP_PASSWORD: ${{ secrets.YAHOO_APP_PASSWORD }}
+      TO_EMAIL: ${{ secrets.TO_EMAIL }}
+      YAHOO_CC: ${{ secrets.YAHOO_CC }}
 
     steps:
       - name: Checkout
@@ -44,18 +51,14 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas>=2.2.2 openpyxl>=3.1.5 reportlab>=4.2.2 feedparser>=6.0.11 requests>=2.32.3 beautifulsoup4>=4.12.3
-
-      - name: Preflight secrets
-        run: |
-          die(){ echo "::error::$1"; exit 1; }
-          [ -n "${{ secrets.YAHOO_EMAIL }}" ]        || die "YAHOO_EMAIL is missing"
-          [ -n "${{ secrets.YAHOO_APP_PASSWORD }}" ] || die "YAHOO_APP_PASSWORD is missing"
-          [ -n "${{ secrets.TO_EMAIL }}" ]           || die "TO_EMAIL is missing"
+          pip install pandas>=2.2.2 openpyxl>=3.1.5 reportlab>=4.2.2 \
+                      feedparser>=6.0.11 requests>=2.32.3 beautifulsoup4>=4.12.3
 
       - name: Run press release tracker
         run: |
-          python .github/press_release_tracker.py --lookback_hours "${LOOKBACK_HOURS}" --send_always "${SEND_ALWAYS}"
+          python .github/press_release_tracker.py \
+            --lookback_hours "${LOOKBACK_HOURS}" \
+            --send_always "${SEND_ALWAYS}"
 
       - name: Commit reports
         run: |
