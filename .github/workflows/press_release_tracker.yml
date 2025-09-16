@@ -37,9 +37,9 @@ jobs:
       SEND_ALWAYS: ${{ github.event.inputs.send_always || 'true' }}
 
       # Yahoo secrets (must exist in repo Settings > Secrets and variables > Actions)
-      YAHOO_EMAIL:        ${{ secrets.YAHOO_EMAIL }}
+      MAIL-FROM:          ${{ secrets.MAIL_FROM }}
       YAHOO_APP_PASSWORD: ${{ secrets.YAHOO_APP_PASSWORD }}
-      YAHOO_TO:           ${{ secrets.YAHOO_TO }}
+      MAIL_TO:            ${{ secrets.MAIL_TO }}
       YAHOO_CC:           ${{ secrets.YAHOO_CC }}
 
     steps:
@@ -59,9 +59,9 @@ jobs:
       - name: Preflight secrets
         run: |
           die(){ echo "::error::$1"; exit 1; }
-          [ -n "${YAHOO_EMAIL}" ]        || die "YAHOO_EMAIL is missing"
+          [ -n "${MAIL_FROM}" ]        || die "MAIL FROM is missing"
           [ -n "${YAHOO_APP_PASSWORD}" ] || die "YAHOO_APP_PASSWORD is missing"
-          [ -n "${YAHOO_TO}" ]           || die "YAHOO_TO is missing"
+          [ -n "${MAIL_TO}" ]           || die "MAIL_TO is missing"
 
       - name: Run press release tracker
         run: |
