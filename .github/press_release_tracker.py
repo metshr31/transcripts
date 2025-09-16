@@ -14,7 +14,7 @@ Outputs:
   - reports/press_releases_YYYYMMDD_HHMM.{csv,xlsx,json,pdf}
 """
 
-import os, re, ssl, smtplib, argparse, requests, feedparser, json
+import os, re, ssl, smtplib, argparse, requests, feedparser
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from requests.adapters import HTTPAdapter, Retry
@@ -24,6 +24,7 @@ from pandas import Timestamp
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
+from bs4 import BeautifulSoup
 
 # ---------------- Feeds ----------------
 DEFAULT_FEEDS = [
@@ -73,39 +74,81 @@ def fetch_feed_content(url: str, timeout: int = 45) -> bytes | None:
         print(f"[WARN] HTTP error for {url}: {e}")
     return None
 
-# ---------------- Collect ----------------
+# ---------------- Collect (RSS + HTML fallback) ----------------
 def collect_from_feeds(feed_urls: list[str], lookback_hours: int) -> pd.DataFrame:
     rows, cutoff = [], datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+
     for url in feed_urls:
         try:
             blob = fetch_feed_content(url)
             if not blob:
                 print(f"[WARN] Failed feed {url}: no content")
                 continue
-            feed = feedparser.parse(blob)
-            for e in feed.entries:
-                title = _norm(getattr(e, "title", ""))
-                link  = _norm(getattr(e, "link", "")) or url
-                summ  = _norm(getattr(e, "summary", "") or getattr(e, "description", ""))
 
-                published = None
-                for key in ("published", "updated", "created"):
-                    val = getattr(e, key, None)
-                    if val:
-                        published = _parse_dt(val)
-                        break
-                if published and published < cutoff:
-                    continue
+            text = blob.decode("utf-8", errors="ignore")
+            is_rss = text.strip().startswith("<?xml") or "<rss" in text.lower()
 
-                rows.append({
-                    "source": _domain_from_url(link) or _domain_from_url(url),
-                    "title": title,
-                    "url": link,
-                    "published_utc": published.isoformat() if published else "",
-                    "summary": summ,
-                })
+            if is_rss:
+                # ✅ Normal RSS feed
+                feed = feedparser.parse(text)
+                for e in feed.entries:
+                    title = _norm(getattr(e, "title", ""))
+                    link  = _norm(getattr(e, "link", "")) or url
+                    summ  = _norm(getattr(e, "summary", "") or getattr(e, "description", ""))
+
+                    published = None
+                    for key in ("published", "updated", "created"):
+                        val = getattr(e, key, None)
+                        if val:
+                            published = _parse_dt(val)
+                            break
+                    if published and published < cutoff:
+                        continue
+
+                    rows.append({
+                        "source": _domain_from_url(link) or _domain_from_url(url),
+                        "title": title,
+                        "url": link,
+                        "published_utc": published.isoformat() if published else "",
+                        "summary": summ,
+                    })
+            else:
+                # ✅ HTML fallback
+                print(f"[INFO] Scraping HTML fallback for {url}")
+                soup = BeautifulSoup(text, "html.parser")
+
+                for tag in soup.select("article, div.news-release, div.card, li, a"):
+                    title = _norm(tag.get_text(" ", strip=True))
+                    if not title or len(title) < 10:
+                        continue
+
+                    link = ""
+                    a = tag.find("a", href=True)
+                    if a:
+                        link = a["href"]
+                        if link.startswith("/"):
+                            link = f"https://{_domain_from_url(url)}{link}"
+
+                    summ = ""
+                    p = tag.find("p")
+                    if p:
+                        summ = _norm(p.get_text(" ", strip=True))
+
+                    published = datetime.now(timezone.utc)  # fallback timestamp
+                    if published < cutoff:
+                        continue
+
+                    rows.append({
+                        "source": _domain_from_url(url),
+                        "title": title,
+                        "url": link or url,
+                        "published_utc": published.isoformat(),
+                        "summary": summ,
+                    })
+
         except Exception as ex:
             print(f"[WARN] Feed parse error {url}: {ex}")
+
     return pd.DataFrame(rows)
 
 # ---------------- PDF ----------------
@@ -205,7 +248,7 @@ def main():
     df_raw = collect_from_feeds(feed_urls, lookback_hours)
 
     print(f"[INFO] Raw rows: {len(df_raw)}")
-    df = df_raw  # filtering could go here if desired
+    df = df_raw
     print(f"[INFO] Filtered rows: {len(df)}")
 
     os.makedirs("reports", exist_ok=True)
