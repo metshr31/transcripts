@@ -73,10 +73,10 @@ SECTOR_KEYWORDS = [
     "truck", "trucking", "truckload", "less-than-truckload",
     "intermodal", "rail", "railroad",
     "container", "containers", "drayage", "chassis", "interchange", "ramp",
-    "broker", "brokerage", "3pl", "imc",
+    "broker", "brokerage", "3pl", "intermodal marketing company",
     "transload", "transloading",
     "linehaul", "capacity", "tender", "diesel", "fuel",
-    "supply chain", "freight", "shipper", "bco", "interline", "lane",
+    "supply chain", "freight", "shipper", "intermodal rail", "interline", "lane",
     "service metrics", "transit time",
 ]
 # ➕ Include company names in sector matching as well (for maximum catch-rate)
