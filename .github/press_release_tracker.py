@@ -6,7 +6,7 @@ Press Release Collector → Filter → Report → Email
 ------------------------------------------------
 - Collects from RSS feeds (preferred).
 - Falls back to HTML scraping (Businesswire, Globenewswire, PRNewswire).
-- Filters for trucking/LTL/intermodal/rail/brokers.
+- Filters for trucking/LTL/intermodal/rail/brokers/carriers only.
 - Saves CSV, XLSX, JSON, PDF into /reports.
 - Emails results via Yahoo SMTP.
 
@@ -49,14 +49,15 @@ WATCHLIST_COMPANIES = [
     "NFI", "Hub Group", "Coyote", "Uber Freight", "Convoy", "IMC Companies",
 ]
 
+# -------------------- SECTOR KEYWORDS --------------------
 SECTOR_KEYWORDS = [
     "truck", "trucking", "truckload", "less-than-truckload",
-    "intermodal", "rail", "railroad", "container", "containers",
-    "drayage", "chassis", "interchange", "ramp", "broker", "brokerage",
-    "3pl", "intermodal marketing company", "transload", "transloading",
-    "linehaul", "capacity", "tender", "diesel", "fuel",
-    "supply chain", "freight", "shipper", "intermodal rail", "interline", "lane",
-    "service metrics", "transit time",
+    "intermodal", "rail", "railroad",
+    "container", "drayage", "chassis", "interchange", "ramp",
+    "broker", "brokerage", "3pl", "intermodal marketing company",
+    "transload", "transloading",
+    "linehaul", "tender", "diesel", "fuel",
+    "freight", "shipper", "lane",
 ]
 SECTOR_KEYWORDS.extend(WATCHLIST_COMPANIES)
 
@@ -254,6 +255,11 @@ def main():
 
     os.makedirs("reports", exist_ok=True)
     tag = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+
+    # Fix Excel crash: strip timezone
+    if "_dt" in df.columns:
+        df["_dt"] = df["_dt"].dt.tz_localize(None)
+
     out_csv, out_json, out_xlsx, out_pdf = (
         f"reports/press_releases_{tag}.csv",
         f"reports/press_releases_{tag}.json",
@@ -262,7 +268,8 @@ def main():
     )
     df.to_csv(out_csv, index=False)
     df.to_json(out_json, orient="records", indent=2, date_format="iso")
-    with pd.ExcelWriter(out_xlsx) as xl: df.to_excel(xl, index=False)
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as xl:
+        df.to_excel(xl, index=False)
     write_pdf(df, out_pdf, "Press Release Brief")
 
     subject = f"[Press Releases] {len(df)} items in last {lookback_hours}h"
