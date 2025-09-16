@@ -2,28 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-Press Release Collector → Filter → Report → Email
+Press Release Tracker → Filter → Report → Email (Yahoo-only)
 
-- Collects from RSS feeds (with HTML scraping fallback for newsroom pages).
-- Strict, low-noise filters for trucking/LTL/intermodal/rail/brokers.
-- Avoids junk like TL/LTL abbreviations, lawsuits, awareness months, festivals.
-- Exports CSV, XLSX, JSON, PDF into reports/press_releases_YYYYMMDD_HHMM.*.
-- Emails results via Yahoo SMTP.
+Secrets required (set in GitHub Actions > Settings > Secrets):
+  - YAHOO_EMAIL          : Yahoo sender email
+  - YAHOO_APP_PASSWORD   : Yahoo app password (16-char)
+  - TO_EMAIL             : comma-separated recipients
+  - YAHOO_CC             : optional comma-separated CCs
 
-Environment variables (set in GitHub Actions secrets):
-  LOOKBACK_HOURS, SEND_ALWAYS, COLLECT, INPUT_PATH, SOURCE_URLS, STRICT_POSITIVE
-  YAHOO_EMAIL, YAHOO_APP_PASSWORD, TO_EMAIL, YAHOO_CC
+Outputs:
+  - reports/press_releases_YYYYMMDD_HHMM.{csv,xlsx,json,pdf}
 """
 
-import os, re, ssl, smtplib, argparse
-from datetime import datetime, timezone
+import os, re, ssl, smtplib, argparse, requests, feedparser, json
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from requests.adapters import HTTPAdapter, Retry
 
 import pandas as pd
 from pandas import Timestamp
-import feedparser, requests
-from requests.adapters import HTTPAdapter, Retry
-from bs4 import BeautifulSoup
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
@@ -35,176 +32,81 @@ DEFAULT_FEEDS = [
     "https://www.businesswire.com/portal/site/home/news/rss/industry/?vnsId=1050097",
     "https://www.businesswire.com/portal/site/home/news/rss/industry/?vnsId=1000155",
     "https://www.businesswire.com/portal/site/home/news/rss/industry/?vnsId=1000188",
-    # HTML fallback pages
-    "https://www.businesswire.com/newsroom?industry=1050097",
-    "https://www.businesswire.com/newsroom?industry=1000155",
-    "https://www.businesswire.com/newsroom?industry=1000188",
     "https://www.prnewswire.com/news/norfolk-southern-corporation/",
     "https://www.prnewswire.com/news/cpkc/",
     "https://www.globenewswire.com/search/organization/Hub%20Group%20Inc",
 ]
 
-# ---------------- Watchlist companies ----------------
-WATCHLIST_COMPANIES = [
-    "Union Pacific", "BNSF", "CSX", "Norfolk Southern",
-    "Canadian National", "Canadian Pacific Kansas City", "CPKC",
-    "J.B. Hunt", "Schneider", "Knight-Swift", "Swift", "Werner",
-    "Heartland Express", "Prime Inc", "Old Dominion", "ODFL",
-    "Saia", "XPO", "Yellow", "Estes", "R+L", "ABF Freight", "ArcBest", "TFI",
-    "C.H. Robinson", "CHRW", "RXO", "Echo Global Logistics", "Arrive Logistics",
-    "NFI", "Hub Group", "Coyote", "Uber Freight", "Convoy",
-    "Schneider Logistics", "IMC Companies",
-]
-
-# ---------------- Sector keywords ----------------
-SECTOR_KEYWORDS = [
-    "truck", "trucking", "truckload", "less-than-truckload",
-    "intermodal", "rail", "railroad",
-    "container", "containers", "drayage", "chassis", "interchange", "ramp",
-    "broker", "brokerage", "3pl", "intermodal marketing company",
-    "transload", "transloading",
-    "linehaul", "capacity", "tender", "diesel", "fuel",
-    "supply chain", "freight", "shipper", "intermodal rail", "interline", "lane",
-    "service metrics", "transit time",
-]
-SECTOR_KEYWORDS.extend(WATCHLIST_COMPANIES)
-
-# ---------------- Domain filters ----------------
-SOURCE_DOMAIN_ALLOWLIST = {
-    "www.globenewswire.com", "www.businesswire.com", "www.prnewswire.com",
-    "newsroom.jbhunt.com", "media.unionpacific.com", "www.bnsf.com",
-    "investors.csx.com", "media.nscorp.com", "www.cn.ca", "www.cpkcr.com",
-    "investors.schneider.com", "investors.hubgroup.com", "investors.chrobinson.com",
-}
-EXCLUSION_DOMAINS = {
-    "api.taboola.com", "ad.doubleclick.net",
-    "mail.yahoo.com", "r.mail.yahoo.com", "news.mail.yahoo.com",
-}
-EXCLUSION_PHRASES = [
-    "class action", "securities litigation", "shareholder alert", "investigation -",
-    "rosen law firm", "pomerantz", "glancy prongay", "monteverde & associates",
-    "awareness month", "festival", "haunted", "pelvic tech", "ubiquinol",
-]
-
 # ---------------- Helpers ----------------
 def _norm(s: str) -> str: return (s or "").strip()
+
 def _domain_from_url(url: str) -> str:
     try: return re.sub(r"^https?://", "", url.split("/")[2].lower())
     except Exception: return ""
+
 def _parse_dt(dt_str: str):
     if not dt_str: return None
     try: return Timestamp(dt_str).to_pydatetime().astimezone(timezone.utc)
     except Exception: return None
-def _contains_any(text: str, needles: list[str]) -> bool:
-    t = (text or "").lower()
-    return any(n and n.lower() in t for n in needles)
-def _build_word_regex(terms: list[str]) -> re.Pattern:
-    safe = [re.escape(t.strip()) for t in terms if t and t.strip()]
-    return re.compile(r"\b(?:%s)\b" % "|".join(safe) if safe else r"$^", re.IGNORECASE)
 
-RE_WATCHLIST = _build_word_regex(WATCHLIST_COMPANIES)
-RE_SECTOR    = _build_word_regex(SECTOR_KEYWORDS)
-
-# ---------------- Fetch & scrape ----------------
-def fetch_feed_content(url: str, timeout: int = 15) -> bytes | None:
+# ---------------- Fetch ----------------
+def fetch_feed_content(url: str, timeout: int = 45) -> bytes | None:
+    """Fetch RSS/HTML with retries and longer timeout for BusinessWire etc."""
     s = requests.Session()
-    retries = Retry(total=4, backoff_factor=0.8,
-                    status_forcelist=[429, 500, 502, 503, 504],
-                    raise_on_status=False)
+    retries = Retry(
+        total=6,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False,
+    )
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.mount("http://", HTTPAdapter(max_retries=retries))
-    headers = {"User-Agent": "Mozilla/5.0 (PressReleaseBot/1.0)"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; PressReleaseBot/1.0)",
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+    }
     try:
         r = s.get(url, headers=headers, timeout=timeout)
-        if r.ok and r.content: return r.content
+        if r.ok and r.content:
+            return r.content
     except requests.RequestException as e:
         print(f"[WARN] HTTP error for {url}: {e}")
     return None
 
-def scrape_newsroom_page(url: str) -> list[dict]:
-    rows = []
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        if not r.ok: return rows
-        soup = BeautifulSoup(r.text, "html.parser")
-        for a in soup.select("a[href]"):
-            title = a.get_text(strip=True)
-            link = a["href"]
-            if not title or not link: continue
-            if link.startswith("/"): link = f"https://{_domain_from_url(url)}{link}"
-            rows.append({
-                "source": _domain_from_url(url),
-                "companies_matched": "",
-                "title": title,
-                "url": link,
-                "published_utc": "",
-                "summary": "",
-            })
-    except Exception as ex:
-        print(f"[WARN] Scrape error {url}: {ex}")
-    return rows
-
 # ---------------- Collect ----------------
-def collect_from_feeds(feed_urls: list[str]) -> pd.DataFrame:
-    rows = []
+def collect_from_feeds(feed_urls: list[str], lookback_hours: int) -> pd.DataFrame:
+    rows, cutoff = [], datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     for url in feed_urls:
         try:
             blob = fetch_feed_content(url)
-            if blob:
-                feed = feedparser.parse(blob)
-                if feed.entries:
-                    for e in feed.entries:
-                        title = _norm(getattr(e, "title", ""))
-                        link  = _norm(getattr(e, "link", "")) or url
-                        summ  = _norm(getattr(e, "summary", "") or getattr(e, "description", ""))
-                        published = None
-                        for key in ("published", "updated", "created"):
-                            val = getattr(e, key, None)
-                            if val: published = _parse_dt(val); break
-                        rows.append({
-                            "source": _domain_from_url(link) or _domain_from_url(url),
-                            "companies_matched": "",
-                            "title": title,
-                            "url": link,
-                            "published_utc": published.isoformat() if published else "",
-                            "summary": summ,
-                        })
+            if not blob:
+                print(f"[WARN] Failed feed {url}: no content")
+                continue
+            feed = feedparser.parse(blob)
+            for e in feed.entries:
+                title = _norm(getattr(e, "title", ""))
+                link  = _norm(getattr(e, "link", "")) or url
+                summ  = _norm(getattr(e, "summary", "") or getattr(e, "description", ""))
+
+                published = None
+                for key in ("published", "updated", "created"):
+                    val = getattr(e, key, None)
+                    if val:
+                        published = _parse_dt(val)
+                        break
+                if published and published < cutoff:
                     continue
-            # fallback
-            print(f"[INFO] Scraping fallback for {url}")
-            rows.extend(scrape_newsroom_page(url))
+
+                rows.append({
+                    "source": _domain_from_url(link) or _domain_from_url(url),
+                    "title": title,
+                    "url": link,
+                    "published_utc": published.isoformat() if published else "",
+                    "summary": summ,
+                })
         except Exception as ex:
-            print(f"[WARN] Collection error {url}: {ex}")
+            print(f"[WARN] Feed parse error {url}: {ex}")
     return pd.DataFrame(rows)
-
-# ---------------- Filter ----------------
-def apply_filters(df_raw: pd.DataFrame, strict_mode: int = 1) -> pd.DataFrame:
-    if df_raw is None or df_raw.empty: return pd.DataFrame()
-    df = df_raw.copy()
-
-    for c in ["title", "summary", "companies_matched", "source", "url"]:
-        if c in df.columns: df[c] = df[c].astype(str).fillna("").map(_norm)
-
-    if "url" in df.columns:
-        df["_domain"] = df["url"].map(_domain_from_url)
-        df = df[~df["_domain"].isin(EXCLUSION_DOMAINS)]
-        if SOURCE_DOMAIN_ALLOWLIST:
-            df = df[df["_domain"].isin(SOURCE_DOMAIN_ALLOWLIST)]
-
-    excl_mask = df.apply(lambda r: _contains_any(
-        (r.get("title","") + " " + r.get("summary","")), EXCLUSION_PHRASES), axis=1)
-    df = df[~excl_mask]
-
-    def row_positive(r) -> bool:
-        text = f"{r.get('title','')} {r.get('summary','')} {r.get('companies_matched','')}"
-        has_company = bool(RE_WATCHLIST.search(text))
-        has_sector = bool(RE_SECTOR.search(text))
-        return (has_company and has_sector) if strict_mode == 2 else (has_company or has_sector)
-    df = df[df.apply(row_positive, axis=1)]
-
-    if "url" in df.columns: df = df.drop_duplicates(subset=["url"])
-    if "title" in df.columns: df = df.drop_duplicates(subset=["title"])
-    return df
 
 # ---------------- PDF ----------------
 def write_pdf(df: pd.DataFrame, path: str, title: str):
@@ -213,31 +115,28 @@ def write_pdf(df: pd.DataFrame, path: str, title: str):
     c.setFont("Helvetica-Bold", 14); c.drawString(margin, y, title); y -= 0.3 * inch
     c.setFont("Helvetica", 9)
     if df.empty:
-        c.drawString(margin, y, "No qualifying press releases."); c.save(); return
+        c.drawString(margin, y, "No qualifying press releases in the selected window.")
+        c.save(); return
 
     def draw_line(text: str):
         nonlocal y
         while text:
-            if len(text) <= 110: line, text = text, ""
+            if len(text) <= 110:
+                line, text = text, ""
             else:
                 cut = text.rfind(" ", 0, 110); cut = 110 if cut == -1 else cut
                 line, text = text[:cut], text[cut:].lstrip()
-            if y < 1.0 * inch: c.showPage(); y = height - margin; c.setFont("Helvetica", 9)
+            if y < 1.0 * inch:
+                c.showPage(); y = height - margin; c.setFont("Helvetica", 9)
             c.drawString(margin, y, line); y -= 12
 
     for _, r in df.iterrows():
-        t = _norm(r.get("title") or "")
-        u = _norm(r.get("url") or "")
-        s = _norm(r.get("summary") or "")
-        ts = r.get("published_utc") or ""
-
+        t = _norm(r.get("title") or ""); u = _norm(r.get("url") or ""); s = _norm(r.get("summary") or "")
+        ts = r.get("published_utc", "")
         draw_line(f"• {t}")
-        if u:
-            draw_line(f"  {u}")
-        if ts:
-            draw_line(f"  {ts}")
-        if s:
-            draw_line(f"  {s}")
+        if u: draw_line(f"  {u}")
+        if ts: draw_line(f"  {ts}")
+        if s: draw_line(f"  {s}")
         y -= 6
     c.save()
 
@@ -247,15 +146,31 @@ def send_email(subject: str, html_body: str, attachments: list[tuple[str, bytes,
     app_pw = os.environ.get("YAHOO_APP_PASSWORD", "").strip()
     to_raw = os.environ.get("TO_EMAIL", "").strip()
     cc_raw = os.environ.get("YAHOO_CC", "").strip()
+
     if not (sender and app_pw and to_raw):
         raise RuntimeError("Missing YAHOO_EMAIL, YAHOO_APP_PASSWORD, or TO_EMAIL.")
 
     to_list = [x.strip() for x in to_raw.split(",") if x.strip()]
     cc_list = [x.strip() for x in cc_raw.split(",") if x.strip()] if cc_raw else []
 
+    # Mask for logging
+    def mask(addr: str) -> str:
+        if "@" in addr:
+            user, domain = addr.split("@", 1)
+            return user[0] + "***@" + domain
+        return addr
+
+    print(f"[INFO] Preparing email:")
+    print(f"  From: {mask(sender)}")
+    print(f"  To:   {[mask(a) for a in to_list]}")
+    if cc_list:
+        print(f"  Cc:   {[mask(a) for a in cc_list]}")
+
     msg = EmailMessage()
-    msg["From"] = sender; msg["To"] = ", ".join(to_list)
-    if cc_list: msg["Cc"] = ", ".join(cc_list)
+    msg["From"] = sender
+    msg["To"] = ", ".join(to_list)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
     msg["Subject"] = subject
     msg.set_content("HTML version required to view this report.")
     msg.add_alternative(html_body, subtype="html")
@@ -264,8 +179,17 @@ def send_email(subject: str, html_body: str, attachments: list[tuple[str, bytes,
         maintype, subtype = mime.split("/", 1)
         msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=fname)
 
-    with smtplib.SMTP_SSL("smtp.mail.yahoo.com", 465, context=ssl.create_default_context()) as s:
-        s.login(sender, app_pw); s.send_message(msg)
+    try:
+        with smtplib.SMTP_SSL("smtp.mail.yahoo.com", 465, context=ssl.create_default_context()) as s:
+            s.login(sender, app_pw)
+            s.send_message(msg)
+        print("[OK] Email sent successfully.")
+    except smtplib.SMTPAuthenticationError:
+        print("[ERROR] SMTP authentication failed — check YAHOO_EMAIL and YAHOO_APP_PASSWORD secrets.")
+        raise
+    except smtplib.SMTPException as e:
+        print(f"[ERROR] SMTP error: {e}")
+        raise
 
 # ---------------- Main ----------------
 def main():
@@ -277,20 +201,12 @@ def main():
     lookback_hours = int(str(args.lookback_hours))
     send_always = str(args.send_always).lower().strip() == "true"
 
-    collect = os.environ.get("COLLECT","1").strip() != "0"
-    input_path = os.environ.get("INPUT_PATH","outputs/press_releases_raw.csv")
-    strict_mode = 2 if os.environ.get("STRICT_POSITIVE","1").strip() == "2" else 1
+    feed_urls = DEFAULT_FEEDS
+    df_raw = collect_from_feeds(feed_urls, lookback_hours)
 
-    env_urls = os.environ.get("SOURCE_URLS","").strip()
-    feed_urls = [u.strip() for u in env_urls.split(",") if u.strip()] if env_urls else DEFAULT_FEEDS
-
-    if collect:
-        df_raw = collect_from_feeds(feed_urls)
-    else:
-        if not os.path.exists(input_path): df_raw = pd.DataFrame()
-        else: df_raw = pd.read_json(input_path) if input_path.lower().endswith(".json") else pd.read_csv(input_path)
-
-    df = apply_filters(df_raw, strict_mode=strict_mode)
+    print(f"[INFO] Raw rows: {len(df_raw)}")
+    df = df_raw  # filtering could go here if desired
+    print(f"[INFO] Filtered rows: {len(df)}")
 
     os.makedirs("reports", exist_ok=True)
     now_tag = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
@@ -299,21 +215,20 @@ def main():
 
     df.to_csv(out_csv, index=False)
     df.to_json(out_json, orient="records", indent=2, date_format="iso")
-    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as xl: df.to_excel(xl, index=False, sheet_name="Press Releases")
-    write_pdf(df, out_pdf, title="Press Release Brief — TL/LTL/Intermodal/Rail/Brokers")
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as xl:
+        df.to_excel(xl, index=False, sheet_name="Press Releases")
+    write_pdf(df, out_pdf, title="Press Release Brief")
 
-    total = len(df)
-    subject = f"[Press Releases] {total} items in last {lookback_hours}h"
+    total = len(df); subject = f"[Press Releases] {total} items in last {lookback_hours}h"
     if total or send_always:
+        rows_html = ""
         if total:
-            rows = []
             for _, r in df.head(100).iterrows():
                 t, u, s = _norm(r.get("title","")), _norm(r.get("url","")), _norm(r.get("summary",""))
-                ts = r.get("published_utc") or ""
+                ts = r.get("published_utc"); ts_str = ts if ts else ""
                 dom = r.get("source","")
-                rows.append(f"""<tr><td style="padding:6px;border-bottom:1px solid #ddd;">
-                    <a href="{u}">{t}</a><br><span style="color:#666;">{dom} | {ts}</span><br><span>{s}</span></td></tr>""")
-            rows_html = "\n".join(rows)
+                rows_html += f"""<tr><td style="padding:6px;border-bottom:1px solid #ddd;">
+                    <a href="{u}">{t}</a><br><span style="color:#666;">{dom} | {ts_str}</span><br><span>{s}</span></td></tr>"""
         else:
             rows_html = f'<tr><td style="padding:12px;">No qualifying items in the last {lookback_hours} hours.</td></tr>'
 
@@ -334,7 +249,6 @@ def main():
                 attachments.append((os.path.basename(path), f.read(), mime))
 
         send_email(subject, html_body, attachments)
-        print(f"[OK] Emailed report with {total} items.")
     else:
         print("[OK] No items and SEND_ALWAYS=false — no email sent.")
 
