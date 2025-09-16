@@ -16,7 +16,7 @@ Environment variables (set in GitHub Actions secrets):
 """
 
 import os, re, ssl, smtplib, argparse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from email.message import EmailMessage
 
 import pandas as pd
@@ -46,14 +46,11 @@ DEFAULT_FEEDS = [
 
 # ---------------- Watchlist companies ----------------
 WATCHLIST_COMPANIES = [
-    # Class I rail
     "Union Pacific", "BNSF", "CSX", "Norfolk Southern",
     "Canadian National", "Canadian Pacific Kansas City", "CPKC",
-    # TL / LTL
     "J.B. Hunt", "Schneider", "Knight-Swift", "Swift", "Werner",
     "Heartland Express", "Prime Inc", "Old Dominion", "ODFL",
     "Saia", "XPO", "Yellow", "Estes", "R+L", "ABF Freight", "ArcBest", "TFI",
-    # Brokers / IMCs
     "C.H. Robinson", "CHRW", "RXO", "Echo Global Logistics", "Arrive Logistics",
     "NFI", "Hub Group", "Coyote", "Uber Freight", "Convoy",
     "Schneider Logistics", "IMC Companies",
@@ -185,23 +182,19 @@ def apply_filters(df_raw: pd.DataFrame, strict_mode: int = 1) -> pd.DataFrame:
     if df_raw is None or df_raw.empty: return pd.DataFrame()
     df = df_raw.copy()
 
-    # normalize
     for c in ["title", "summary", "companies_matched", "source", "url"]:
         if c in df.columns: df[c] = df[c].astype(str).fillna("").map(_norm)
 
-    # domain filters
     if "url" in df.columns:
         df["_domain"] = df["url"].map(_domain_from_url)
         df = df[~df["_domain"].isin(EXCLUSION_DOMAINS)]
         if SOURCE_DOMAIN_ALLOWLIST:
             df = df[df["_domain"].isin(SOURCE_DOMAIN_ALLOWLIST)]
 
-    # exclude phrases
     excl_mask = df.apply(lambda r: _contains_any(
         (r.get("title","") + " " + r.get("summary","")), EXCLUSION_PHRASES), axis=1)
     df = df[~excl_mask]
 
-    # positive match
     def row_positive(r) -> bool:
         text = f"{r.get('title','')} {r.get('summary','')} {r.get('companies_matched','')}"
         has_company = bool(RE_WATCHLIST.search(text))
@@ -209,7 +202,6 @@ def apply_filters(df_raw: pd.DataFrame, strict_mode: int = 1) -> pd.DataFrame:
         return (has_company and has_sector) if strict_mode == 2 else (has_company or has_sector)
     df = df[df.apply(row_positive, axis=1)]
 
-    # dedup
     if "url" in df.columns: df = df.drop_duplicates(subset=["url"])
     if "title" in df.columns: df = df.drop_duplicates(subset=["title"])
     return df
@@ -234,11 +226,19 @@ def write_pdf(df: pd.DataFrame, path: str, title: str):
             c.drawString(margin, y, line); y -= 12
 
     for _, r in df.iterrows():
-        t = _norm(r.get("title") or ""); u = _norm(r.get("url") or ""); s = _norm(r.get("summary") or "")
+        t = _norm(r.get("title") or "")
+        u = _norm(r.get("url") or "")
+        s = _norm(r.get("summary") or "")
         ts = r.get("published_utc") or ""
-        draw_line(f"• {t}");  if u: draw_line(f"  {u}")
-        if ts: draw_line(f"  {ts}")
-        if s: draw_line(f"  {s}"); y -= 6
+
+        draw_line(f"• {t}")
+        if u:
+            draw_line(f"  {u}")
+        if ts:
+            draw_line(f"  {ts}")
+        if s:
+            draw_line(f"  {s}")
+        y -= 6
     c.save()
 
 # ---------------- Email ----------------
