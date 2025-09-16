@@ -1,7 +1,6 @@
-name: Press Release Tracker (Yahoo Email)
+name: Press Release Filter & Email (Yahoo)
 
 on:
-  # Manual trigger with inputs
   workflow_dispatch:
     inputs:
       lookback_hours:
@@ -14,67 +13,71 @@ on:
         required: true
         default: "true"
         type: string
-
-  # Weekdays at 08:15 & 16:20 ET (EDT=UTC-4)
   schedule:
-    - cron: "15 12 * * 1-5"
-    - cron: "20 20 * * 1-5"
-
-permissions:
-  contents: write
-
-concurrency:
-  group: press-release-tracker
-  cancel-in-progress: false
+    - cron: "15 12 * * 1-5"   # 08:15 ET (GitHub cron is UTC)
+    - cron: "20 20 * * 1-5"   # 16:20 ET
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write
     env:
-      OUTPUT_DIR: outputs
-      MAIL_FROM_NAME: Press Release Tracker
-      # Use manual inputs when present; fallback for scheduled runs
-      LOOKBACK_HOURS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_hours || '24' }}
-      SEND_ALWAYS:   ${{ github.event_name == 'workflow_dispatch' && inputs.send_always   || 'true' }}
-      OUTPUT_FORMATS: "xlsx,pdf"  # any of: xlsx,csv,pdf,docx,json
+      PYTHONUNBUFFERED: "1"
+      INPUT_PATH: "outputs/press_releases_raw.csv"
 
-      # Secrets (set these in your repo settings)
+      # Feeds (edit/override to tighten signal)
+      # SOURCE_URLS: "https://investors.schneider.com/rss/news-releases.xml,https://investors.hubgroup.com/rss/news-releases.xml,https://investors.chrobinson.com/rss/news-releases.xml,https://media.unionpacific.com/releases/rss.xml,https://www.bnsf.com/rss/news-media.xml,https://investors.csx.com/rss/news-releases.xml,https://media.nscorp.com/rss/news.xml,https://www.cpkcr.com/en/media/rss.xml"
+      COLLECT: "1"
+
+      # 1 = company OR sector keyword, 2 = company AND sector keyword
+      STRICT_POSITIVE: "1"
+
+      LOOKBACK_HOURS: ${{ github.event.inputs.lookback_hours || '24' }}
+      SEND_ALWAYS: ${{ github.event.inputs.send_always || 'true' }}
+
+      # Yahoo secrets (must exist in repo Settings > Secrets and variables > Actions)
       YAHOO_EMAIL:        ${{ secrets.YAHOO_EMAIL }}
       YAHOO_APP_PASSWORD: ${{ secrets.YAHOO_APP_PASSWORD }}
-      TO_EMAIL:           ${{ secrets.TO_EMAIL }}
+      YAHOO_TO:           ${{ secrets.YAHOO_TO }}
+      YAHOO_CC:           ${{ secrets.YAHOO_CC }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          # no pip cache here because you don't keep a requirements file in repo
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
-          python -m pip install --upgrade pip wheel setuptools
-          # Core libs for the tracker + file exports
-          pip install "feedparser>=6.0.11" "requests>=2.31" "beautifulsoup4>=4.12" "lxml>=5.0" \
-                      "python-dateutil>=2.9" "pytz>=2024.1" "pandas>=2.2" "openpyxl>=3.1" \
-                      "python-docx>=1.1" "reportlab>=4.2"
+          python -m pip install --upgrade pip
+          pip install pandas>=2.2.2 openpyxl>=3.1.5 reportlab>=4.2.2 feedparser>=6.0.11 requests>=2.32.3
 
-      - name: Verify script exists
+      - name: Preflight secrets
         run: |
-          test -f .github/press_release_tracker.py || (echo "ERROR: .github/press_release_tracker.py not found"; exit 1)
+          die(){ echo "::error::$1"; exit 1; }
+          [ -n "${YAHOO_EMAIL}" ]        || die "YAHOO_EMAIL is missing"
+          [ -n "${YAHOO_APP_PASSWORD}" ] || die "YAHOO_APP_PASSWORD is missing"
+          [ -n "${YAHOO_TO}" ]           || die "YAHOO_TO is missing"
 
       - name: Run press release tracker
         run: |
-          mkdir -p "$OUTPUT_DIR"
-          python .github/press_release_tracker.py
+          python press_releases_tracker.py --lookback_hours "${LOOKBACK_HOURS}" --send_always "${SEND_ALWAYS}"
 
-      - name: Upload outputs (optional)
+      - name: Commit reports
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/ || true
+          git commit -m "Press Release report ($(date -u +'%Y-%m-%d %H:%M UTC'))" || echo "No changes"
+          git push || echo "No push"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: press-release-tracker
-          path: outputs/**
+          name: press_release_reports
+          path: reports/*.*
           if-no-files-found: ignore
-          retention-days: 14
