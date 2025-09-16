@@ -4,8 +4,9 @@
 """
 Press Release Collector → Filter → Report → Email
 ------------------------------------------------
-- Collects press releases from RSS or newsroom HTML.
-- Filters strictly for trucking/LTL/intermodal/rail/broker/brokerage.
+- Collects from RSS feeds (preferred).
+- Falls back to HTML scraping (Businesswire, Globenewswire, PRNewswire).
+- Filters for trucking/LTL/intermodal/rail/brokers.
 - Saves CSV, XLSX, JSON, PDF into /reports.
 - Emails results via Yahoo SMTP.
 
@@ -24,6 +25,7 @@ from pandas import Timestamp
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
+from bs4 import BeautifulSoup
 
 # -------------------- FEEDS --------------------
 DEFAULT_FEEDS = [
@@ -88,7 +90,7 @@ def _build_word_regex(terms):
 RE_WATCHLIST = _build_word_regex(WATCHLIST_COMPANIES)
 RE_SECTOR    = _build_word_regex(SECTOR_KEYWORDS)
 
-def fetch_feed_content(url: str, timeout: int = 45):
+def fetch_content(url: str, timeout: int = 45):
     s = requests.Session()
     retries = Retry(total=6, backoff_factor=1,
                     status_forcelist=[429, 500, 502, 503, 504])
@@ -96,20 +98,72 @@ def fetch_feed_content(url: str, timeout: int = 45):
     headers = {"User-Agent": "Mozilla/5.0 PressReleaseBot"}
     try:
         r = s.get(url, headers=headers, timeout=timeout)
-        if r.ok: return r.content
+        if r.ok: return r.text
     except Exception as e:
         print(f"[WARN] Fetch error {url}: {e}")
     return None
 
+# -------------------- SCRAPERS --------------------
+def scrape_businesswire(url):
+    html = fetch_content(url)
+    if not html: return []
+    soup = BeautifulSoup(html, "html.parser")
+    articles = []
+    for a in soup.select("a[data-resource-type='PressRelease']"):
+        link = "https://www.businesswire.com" + a.get("href", "")
+        title = _norm(a.get_text())
+        if title:
+            articles.append({"title": title, "url": link, "summary": "", 
+                             "published_utc": datetime.now(timezone.utc).isoformat(),
+                             "source": "businesswire.com"})
+    return articles
+
+def scrape_globenewswire(url):
+    html = fetch_content(url)
+    if not html: return []
+    soup = BeautifulSoup(html, "html.parser")
+    articles = []
+    for a in soup.select("div.release-card a[href]"):
+        link = a.get("href", "")
+        title = _norm(a.get_text())
+        if title:
+            articles.append({"title": title, "url": link, "summary": "",
+                             "published_utc": datetime.now(timezone.utc).isoformat(),
+                             "source": "globenewswire.com"})
+    return articles
+
+def scrape_prnewswire(url):
+    html = fetch_content(url)
+    if not html: return []
+    soup = BeautifulSoup(html, "html.parser")
+    articles = []
+    for a in soup.select("div.card a[href]"):
+        link = a.get("href", "")
+        if not link.startswith("http"): link = "https://www.prnewswire.com" + link
+        title = _norm(a.get_text())
+        if title:
+            articles.append({"title": title, "url": link, "summary": "",
+                             "published_utc": datetime.now(timezone.utc).isoformat(),
+                             "source": "prnewswire.com"})
+    return articles
+
 # -------------------- COLLECT --------------------
 def collect_from_feeds(feed_urls, lookback_hours: int):
-    rows, cutoff = [], datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    rows = []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     for url in feed_urls:
-        blob = fetch_feed_content(url)
-        if not blob: 
+        if "businesswire.com" in url:
+            rows.extend(scrape_businesswire(url)); continue
+        if "globenewswire.com" in url and "RssFeed" not in url:
+            rows.extend(scrape_globenewswire(url)); continue
+        if "prnewswire.com" in url:
+            rows.extend(scrape_prnewswire(url)); continue
+
+        content = fetch_content(url)
+        if not content:
             print(f"[WARN] Failed feed {url}: no content")
             continue
-        feed = feedparser.parse(blob)
+        feed = feedparser.parse(content)
         for e in feed.entries:
             title = _norm(getattr(e, "title", ""))
             link  = _norm(getattr(e, "link", "")) or url
@@ -119,11 +173,9 @@ def collect_from_feeds(feed_urls, lookback_hours: int):
                 if getattr(e, key, None):
                     published = _parse_dt(getattr(e, key)); break
             if published and published < cutoff: continue
-            rows.append({
-                "title": title, "url": link, "summary": summ,
-                "published_utc": published.isoformat() if published else "",
-                "source": _domain_from_url(link),
-            })
+            rows.append({"title": title, "url": link, "summary": summ,
+                         "published_utc": published.isoformat() if published else "",
+                         "source": _domain_from_url(link)})
     return pd.DataFrame(rows)
 
 # -------------------- FILTER --------------------
