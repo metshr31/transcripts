@@ -6,7 +6,7 @@ on:
       lookback_hours:
         description: "Lookback window (hours)"
         required: true
-        default: "24"
+        default: "48"
         type: string
       send_always:
         description: "Email even if 0 items? (true/false)"
