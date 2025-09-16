@@ -9,7 +9,7 @@ One Big Beautiful PY — Press Release Collector → Filter → Report → Email
 - NO noisy abbreviations: removes "TL", "LTL", "Class I" to prevent junk matches.
 - Hard-blocks ad/portal links; excludes class-action/awareness/festival junk.
 - Writes CSV, XLSX, JSON, PDF into reports/press_releases_YYYYMMDD_HHMM.*
-- Emails attachments via Yahoo SMTP (secrets: YAHOO_EMAIL, YAHOO_APP_PASSWORD, YAHOO_TO).
+- Emails attachments via Yahoo SMTP (secrets: MAIL_FROM, YAHOO_APP_PASSWORD, MAIL_TO).
 
 CLI:
   python press_releases_report.py --lookback_hours 24 --send_always true
@@ -21,7 +21,7 @@ Environment:
   INPUT_PATH      (if COLLECT=0; default "outputs/press_releases_raw.csv")
   SOURCE_URLS     (comma-separated RSS URLs; if empty, uses DEFAULT_FEEDS)
   STRICT_POSITIVE ("1" default => company OR sector; "2" => require BOTH)
-  YAHOO_EMAIL, YAHOO_APP_PASSWORD, YAHOO_TO, (optional) YAHOO_CC
+  MAIL_FROM, YAHOO_APP_PASSWORD, MAIL_TO, (optional) YAHOO_CC
 """
 
 import os, re, ssl, json, smtplib, argparse
@@ -263,12 +263,12 @@ def write_pdf(df: pd.DataFrame, path: str, title: str):
 
 # ---------------- Email ----------------
 def send_email(subject: str, html_body: str, attachments: list[tuple[str, bytes, str]]):
-    sender = os.environ.get("YAHOO_EMAIL","").strip()
+    sender = os.environ.get("MAIL_FROM","").strip()
     app_pw = os.environ.get("YAHOO_APP_PASSWORD","").strip()
-    to_raw = os.environ.get("YAHOO_TO","").strip()
+    to_raw = os.environ.get("MAIL_TO","").strip()
     cc_raw = os.environ.get("YAHOO_CC","").strip()
     if not (sender and app_pw and to_raw):
-        raise RuntimeError("Missing YAHOO_EMAIL, YAHOO_APP_PASSWORD, or YAHOO_TO.")
+        raise RuntimeError("Missing MAIL_FROM, YAHOO_APP_PASSWORD, or MAIL_TO.")
     to_list = [x.strip() for x in to_raw.split(",") if x.strip()]
     cc_list = [x.strip() for x in cc_raw.split(",") if x.strip()] if cc_raw else []
 
