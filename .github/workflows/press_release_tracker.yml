@@ -6,7 +6,7 @@ on:
       lookback_hours:
         description: "Lookback window (hours)"
         required: true
-        default: "12"
+        default: "24"
         type: string
       send_always:
         description: "Email even if 0 items? (true/false)"
@@ -14,7 +14,7 @@ on:
         default: "true"
         type: string
   schedule:
-    - cron: "15 12 * * 1-5"   # 08:15 ET (GitHub cron is UTC)
+    - cron: "15 12 * * 1-5"   # 08:15 ET
     - cron: "5 13 * * 1-5"    # 09:05 ET
     - cron: "20 20 * * 1-5"   # 16:20 ET
     - cron: "45 20 * * 1-5"   # 16:45 ET
@@ -27,14 +27,8 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       INPUT_PATH: "outputs/press_releases_raw.csv"
-
-      # Feeds (edit/override to tighten signal)
-      # SOURCE_URLS: "https://investors.schneider.com/rss/news-releases.xml,https://investors.hubgroup.com/rss/news-releases.xml,https://investors.chrobinson.com/rss/news-releases.xml,https://media.unionpacific.com/releases/rss.xml,https://www.bnsf.com/rss/news-media.xml,https://investors.csx.com/rss/news-releases.xml,https://media.nscorp.com/rss/news.xml,https://www.cpkcr.com/en/media/rss.xml"
       COLLECT: "1"
-
-      # 1 = company OR sector keyword, 2 = company AND sector keyword
       STRICT_POSITIVE: "1"
-
       LOOKBACK_HOURS: ${{ github.event.inputs.lookback_hours || '24' }}
       SEND_ALWAYS: ${{ github.event.inputs.send_always || 'true' }}
 
@@ -55,9 +49,9 @@ jobs:
       - name: Preflight secrets
         run: |
           die(){ echo "::error::$1"; exit 1; }
-          [ -n "${{ secrets.YAHOO_EMAIL }}" ]          || die "YAHOO_EMAIL is missing"
-          [ -n "${{ secrets.YAHOO_APP_PASSWORD }}" ]   || die "YAHOO_APP_PASSWORD is missing"
-          [ -n "${{ secrets.TO_EMAIL }}" ]             || die "TO_EMAIL is missing"
+          [ -n "${{ secrets.YAHOO_EMAIL }}" ]        || die "YAHOO_EMAIL is missing"
+          [ -n "${{ secrets.YAHOO_APP_PASSWORD }}" ] || die "YAHOO_APP_PASSWORD is missing"
+          [ -n "${{ secrets.TO_EMAIL }}" ]           || die "TO_EMAIL is missing"
 
       - name: Run press release tracker
         run: |
@@ -77,22 +71,3 @@ jobs:
           name: press_release_reports
           path: reports/*.*
           if-no-files-found: ignore
-
-      - name: Email results via Yahoo
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.mail.yahoo.com
-          server_port: 465
-          secure: true
-          username: ${{ secrets.YAHOO_EMAIL }}
-          password: ${{ secrets.YAHOO_APP_PASSWORD }}
-          from: ${{ secrets.YAHOO_EMAIL }}
-          to: ${{ secrets.TO_EMAIL }}
-          cc: ${{ secrets.YAHOO_CC }}
-          subject: "Press Release Report — ${{ github.repository }} — run #${{ github.run_number }}"
-          body: |
-            Press release tracker run completed.
-            Repo: ${{ github.repository }}
-            Run ID: ${{ github.run_id }}
-            Commit: ${{ github.sha }}
-          attachments: reports/*.*
